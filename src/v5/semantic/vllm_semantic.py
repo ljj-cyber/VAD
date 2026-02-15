@@ -1,0 +1,338 @@
+"""
+Stage 2-B: Semantic VLLM — Crop 级别语义推理
+
+改造 VLLMClient:
+  - 输入: crop_image (裁剪后的实体区域)，而非全图
+  - 减少背景干扰，描述更准
+  - 输出结构化数据: {action, action_object, posture, scene_context, is_suspicious, danger_score}
+
+支持:
+  - vLLM server API (并行，推荐)
+  - 本地 transformers (单线程，调试)
+"""
+
+import io
+import base64
+import time
+import json
+import logging
+from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import cv2
+import numpy as np
+from PIL import Image
+
+from ..config import SemanticVLLMConfig, HF_CACHE_DIR
+from .node_trigger import TriggerResult
+
+logger = logging.getLogger(__name__)
+
+
+# ── Prompt ────────────────────────────────────────────
+
+CROP_SYSTEM_PROMPT = """\
+You are a surveillance video analyst. You are given a full surveillance frame \
+with RED/YELLOW bounding boxes highlighting the main moving entities detected \
+by motion analysis. Analyze the scene in two steps.
+
+Rules:
+- STEP 1 — "box_action": Describe WHAT the highlighted entity is doing. \
+  Use precise verbs: walking, running, fighting, crouching, carrying, bending, \
+  setting fire, climbing, lying on ground, gesturing, etc.
+- STEP 2 — "context_relation": Describe the RELATIONSHIP between the entity's \
+  action and the surrounding environment. Is there fire nearby? A vehicle? \
+  A store? Other people? Is the entity interacting with them?
+- "scene_type": the overall scene (street, parking lot, store, gas station, etc.)
+- "is_suspicious": Set to true if ANYTHING seems unusual, even slightly. \
+  This is a LOW threshold — being cautious is better than missing danger. \
+  Examples: crouching near a car at night, running away from a scene, \
+  someone lying on the ground, fire/smoke visible, unusual gathering.
+- "danger_score": \
+  0.0 = clearly normal (walking, standing, shopping). \
+  0.1 = mildly unusual but probably harmless (loitering, crouching). \
+  0.3 = noteworthy (running away, aggressive gesture, smoke visible). \
+  0.5 = suspicious (fighting, forced entry, fire, chasing). \
+  0.7 = clearly dangerous (active violence, large fire, weapons visible). \
+  1.0 = extreme (shooting, explosion, mass violence).
+- Output ONLY JSON, no extra text.
+"""
+
+CROP_USER_PROMPT = """\
+Analyze this surveillance frame at T={timestamp:.2f}s. \
+Red/yellow boxes highlight detected motion regions.
+
+Answer in TWO steps, then score. Output ONLY JSON:
+
+{{
+  "box_action": "<what is the highlighted entity doing?>",
+  "context_relation": "<how does this relate to the surroundings?>",
+  "action": "<precise atomic action verb>",
+  "action_object": "<object being interacted with, or none>",
+  "posture": "<body posture>",
+  "scene_context": "<surrounding environment type>",
+  "is_suspicious": <true|false>,
+  "danger_score": <float 0.0-1.0>
+}}
+"""
+
+# ── 多帧拼图模式 Prompt ──
+GRID_SYSTEM_PROMPT = """\
+You are a surveillance video analyst. You are given a 2×2 grid of 4 consecutive \
+surveillance frames showing the SAME scene over a short time period. \
+The 4 frames are arranged chronologically: top-left is oldest, bottom-right is newest.
+
+Your task: analyze the TEMPORAL CHANGE across these 4 frames.
+
+Rules:
+- Describe what CHANGES between frames (not just what's visible in one frame).
+- Look for: someone pushing/hitting another person, objects being moved, \
+  fire spreading, someone falling, a chase sequence, break-in progression.
+- "action": describe the TEMPORAL action across frames (e.g., "pushing repeatedly", \
+  "setting fire then running", "falling to ground", "picking up and running away").
+- "is_suspicious": true if the sequence shows violence, theft progression, \
+  fire spreading, or any dangerous temporal pattern.
+- "danger_score": based on the SEQUENCE, not any single frame.
+- Output ONLY JSON, no extra text.
+"""
+
+GRID_USER_PROMPT = """\
+This 2×2 grid shows 4 consecutive frames from a surveillance camera \
+around T={timestamp:.2f}s. Oldest=top-left, Newest=bottom-right.
+
+Analyze the TEMPORAL PROGRESSION. What is happening over these frames? \
+Output ONLY JSON:
+
+{{
+  "temporal_action": "<what action unfolds across the 4 frames?>",
+  "context_relation": "<how does this relate to the surroundings?>",
+  "action": "<precise atomic action verb for the latest frame>",
+  "action_object": "<object or none>",
+  "posture": "<body posture in latest frame>",
+  "scene_context": "<environment type>",
+  "is_suspicious": <true|false>,
+  "danger_score": <float 0.0-1.0>
+}}
+"""
+
+
+def _pil_to_base64(image: Image.Image) -> str:
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+class SemanticVLLM:
+    """
+    带全图上下文的语义推理客户端。
+
+    发送"带高亮框的原图"给 VLLM，而非裁剪区域。
+    VLLM 同时看到 entity 和周围环境，减少幻觉。
+    支持批量并行推理。
+    """
+
+    def __init__(self, cfg: Optional[SemanticVLLMConfig] = None):
+        self.cfg = cfg or SemanticVLLMConfig()
+
+    def infer_triggers(
+        self,
+        triggers: list[TriggerResult],
+        painted_images: Optional[dict] = None,
+        grid_images: Optional[dict] = None,
+    ) -> list[dict]:
+        """
+        对一批触发结果进行语义推理。
+
+        Args:
+            triggers: NodeTrigger 输出的触发列表
+            painted_images: frame_idx → PIL.Image (带框全图)
+            grid_images: frame_idx → PIL.Image (4宫格多帧拼图)
+
+        Returns:
+            list[dict]，与 triggers 一一对应
+        """
+        if not triggers:
+            return []
+
+        if self.cfg.backend == "server":
+            return self._infer_server(triggers, painted_images, grid_images)
+        else:
+            return self._infer_local(triggers)
+
+    def _infer_server(
+        self,
+        triggers: list[TriggerResult],
+        painted_images: Optional[dict] = None,
+        grid_images: Optional[dict] = None,
+    ) -> list[dict]:
+        """通过 vLLM server API 并行推理"""
+        import httpx
+
+        model_name = self.cfg.MODEL_PATHS.get(
+            self.cfg.model_name, self.cfg.model_name
+        )
+        results = [None] * len(triggers)
+
+        client = httpx.Client(timeout=90.0)
+
+        def _request_one(idx: int) -> tuple[int, dict]:
+            tr = triggers[idx]
+
+            # 选择输入图像和 Prompt:
+            # 优先级: grid_images(多帧) > painted_images(带框全图) > crop
+            pil_img = None
+            use_grid = False
+
+            if grid_images and tr.frame_idx in grid_images:
+                pil_img = grid_images[tr.frame_idx]
+                use_grid = True
+            elif painted_images and tr.frame_idx in painted_images:
+                pil_img = painted_images[tr.frame_idx]
+            else:
+                crop = tr.trace_entry.crop_image
+                if crop is None:
+                    return idx, self._fallback_result(tr)
+                h, w = crop.shape[:2]
+                target = self.cfg.crop_resize
+                if (w, h) != target:
+                    crop = cv2.resize(crop, target, interpolation=cv2.INTER_LINEAR)
+                pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+
+            b64 = _pil_to_base64(pil_img)
+
+            # 根据输入类型选择 Prompt
+            if use_grid:
+                sys_prompt = GRID_SYSTEM_PROMPT
+                user_prompt = GRID_USER_PROMPT.format(timestamp=tr.timestamp)
+            else:
+                sys_prompt = CROP_SYSTEM_PROMPT
+                user_prompt = CROP_USER_PROMPT.format(timestamp=tr.timestamp)
+
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                            },
+                            {"type": "text", "text": user_prompt},
+                        ],
+                    },
+                ],
+                "max_tokens": self.cfg.max_new_tokens,
+                "temperature": self.cfg.temperature,
+            }
+
+            for attempt in range(1, self.cfg.max_retries + 1):
+                try:
+                    resp = client.post(
+                        f"{self.cfg.api_base}/v1/chat/completions",
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    raw_text = data["choices"][0]["message"]["content"].strip()
+                    parsed = self._parse_response(raw_text)
+                    result = {
+                        "entity_id": tr.entity_id,
+                        "frame_idx": tr.frame_idx,
+                        "timestamp": tr.timestamp,
+                        "trigger_rule": tr.trigger_rule,
+                        **parsed,
+                    }
+                    return idx, result
+                except Exception as e:
+                    if attempt == self.cfg.max_retries:
+                        logger.warning(
+                            f"Semantic VLLM failed for entity #{tr.entity_id} "
+                            f"at frame {tr.frame_idx}: {e}"
+                        )
+                        return idx, self._fallback_result(tr)
+
+        t0 = time.time()
+        try:
+            with ThreadPoolExecutor(max_workers=self.cfg.max_workers) as executor:
+                futures = {executor.submit(_request_one, i): i for i in range(len(triggers))}
+                for future in as_completed(futures):
+                    idx, result = future.result()
+                    results[idx] = result
+        finally:
+            client.close()
+
+        elapsed = time.time() - t0
+        logger.info(
+            f"Semantic VLLM: {len(triggers)} crops in {elapsed:.1f}s "
+            f"({len(triggers)/max(elapsed, 0.01):.1f} crops/s)"
+        )
+
+        return results
+
+    def _infer_local(self, triggers: list[TriggerResult]) -> list[dict]:
+        """本地串行推理（调试用）"""
+        results = []
+        for tr in triggers:
+            results.append(self._fallback_result(tr))
+        return results
+
+    def _parse_response(self, raw_text: str) -> dict:
+        """解析 VLLM JSON 响应"""
+        import re
+
+        # 尝试直接解析
+        try:
+            data = json.loads(raw_text)
+            return self._sanitize(data)
+        except json.JSONDecodeError:
+            pass
+
+        # 查找 JSON 块
+        match = re.search(r'\{[^{}]*\}', raw_text, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                return self._sanitize(data)
+            except json.JSONDecodeError:
+                pass
+
+        logger.warning(f"Failed to parse semantic response: {raw_text[:200]}")
+        return self._default_semantic()
+
+    @staticmethod
+    def _sanitize(data: dict) -> dict:
+        """清理/标准化语义字段"""
+        return {
+            "box_action": str(data.get("box_action", data.get("temporal_action", ""))),
+            "context_relation": str(data.get("context_relation", "")),
+            "action": str(data.get("action", "unknown")),
+            "action_object": str(data.get("action_object", "none")),
+            "posture": str(data.get("posture", "unknown")),
+            "scene_context": str(data.get("scene_context", data.get("scene_type", "unknown"))),
+            "is_suspicious": bool(data.get("is_suspicious", False)),
+            "danger_score": float(data.get("danger_score", 0.0)),
+        }
+
+    @staticmethod
+    def _default_semantic() -> dict:
+        return {
+            "box_action": "",
+            "context_relation": "",
+            "action": "unknown",
+            "action_object": "none",
+            "posture": "unknown",
+            "scene_context": "unknown",
+            "is_suspicious": False,
+            "danger_score": 0.0,
+        }
+
+    def _fallback_result(self, tr: TriggerResult) -> dict:
+        return {
+            "entity_id": tr.entity_id,
+            "frame_idx": tr.frame_idx,
+            "timestamp": tr.timestamp,
+            "trigger_rule": tr.trigger_rule,
+            **self._default_semantic(),
+        }

@@ -1,0 +1,40 @@
+# ── 模型文件 & 缓存 ──
+models/
+*.whl
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# ── 视频数据集 ──
+src/event_seg/videos/
+!src/event_seg/videos/annotations.txt
+
+# ── 输出目录 ──
+output/
+
+# ── Python 缓存 ──
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# ── 环境/IDE ──
+.vscode/
+.cursor/
+*.swp
+*.swo
+.DS_Store
+
+# ── LAVIS/RAFT 第三方（太大，不跟踪） ──
+src/LAVIS/
+src/RAFT/
+
+# ── VideoLLaMA2 源码 ──
+src/score/src/
+
+# ── 临时文件 ──
+*.log
+*.tmp
+nohup.out
