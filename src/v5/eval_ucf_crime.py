@@ -276,30 +276,78 @@ def compute_frame_scores(
     return scores
 
 
+def _hysteresis_threshold(
+    scores: np.ndarray,
+    tau_high: float = 0.35,
+    tau_low: float = 0.15,
+) -> np.ndarray:
+    """
+    滞回阈值：score >= tau_high 启动异常段，score < tau_low 结束。
+    桥接异常段中间的短暂 score 下降，减少碎片化。
+    """
+    mask = np.zeros(len(scores), dtype=bool)
+    in_segment = False
+    for i in range(len(scores)):
+        if not in_segment:
+            if scores[i] >= tau_high:
+                in_segment = True
+                mask[i] = True
+        else:
+            if scores[i] >= tau_low:
+                mask[i] = True
+            else:
+                in_segment = False
+    return mask
+
+
 def compute_frame_iou(
     gt_intervals: list,
     entity_verdicts: list[dict],
     total_frames: int,
     fps: float,
+    temporal_signals: dict = None,
+    mode: str = "soft",
+    tau_high: float = 0.35,
+    tau_low: float = 0.15,
 ) -> float:
+    """
+    帧级 IoU 计算（基于 compute_frame_scores 生成的连续分数）。
+
+    模式:
+      - "soft":       Soft IoU = Σmin(gt, pred) / Σmax(gt, pred)，无阈值
+      - "hysteresis": 滞回阈值二值化后计算 hard IoU
+    """
     if total_frames <= 0:
         return 0.0
 
-    gt_mask = build_gt_mask(gt_intervals, total_frames)
-    pred_mask = np.zeros(total_frames, dtype=bool)
+    gt_mask = build_gt_mask(gt_intervals, total_frames).astype(np.float32)
 
-    for v in entity_verdicts:
-        if not v.get("is_anomaly", False):
-            continue
-        sf = int(float(v.get("anomaly_start_sec", 0)) * fps)
-        ef = int(float(v.get("anomaly_end_sec", 0)) * fps)
-        pred_mask[max(0, sf): min(ef, total_frames)] = True
+    # 用多信号融合帧级分数替代粗糙的 entity verdict 矩形区间
+    video_confidence = max(
+        (float(v.get("confidence", 0.0)) for v in entity_verdicts if v.get("is_anomaly")),
+        default=0.0,
+    )
+    scores = compute_frame_scores(
+        entity_verdicts, video_confidence,
+        total_frames, fps,
+        temporal_signals=temporal_signals,
+    )
 
-    inter = np.logical_and(gt_mask, pred_mask).sum()
-    union = np.logical_or(gt_mask, pred_mask).sum()
-    if union == 0:
-        return 1.0 if inter == 0 else 0.0
-    return float(inter) / float(union)
+    if mode == "soft":
+        # Soft IoU: 无阈值，信息保留最完整
+        numerator = np.minimum(gt_mask, scores).sum()
+        denominator = np.maximum(gt_mask, scores).sum()
+        if denominator < 1e-8:
+            return 1.0 if numerator < 1e-8 else 0.0
+        return float(numerator / denominator)
+
+    else:  # "hysteresis"
+        pred_mask = _hysteresis_threshold(scores, tau_high, tau_low)
+        inter = np.logical_and(gt_mask > 0.5, pred_mask).sum()
+        union = np.logical_or(gt_mask > 0.5, pred_mask).sum()
+        if union == 0:
+            return 1.0 if inter == 0 else 0.0
+        return float(inter) / float(union)
 
 
 # ── 评估主逻辑 ────────────────────────────────────────
@@ -311,7 +359,13 @@ def evaluate(
     max_workers: int = 16,
     parallel_videos: int = 3,
     balanced: bool = True,
+    backend: str = "server",
 ) -> dict:
+    # 本地推理时强制串行（模型单线程）
+    if backend == "local" and parallel_videos > 1:
+        logger.info(f"Local backend: forcing parallel=1 (was {parallel_videos})")
+        parallel_videos = 1
+
     if max_videos > 0:
         if balanced:
             # 均衡采样：异常和正常各取一半
@@ -345,7 +399,7 @@ def evaluate(
         pipe = TubeSkeletonPipeline(
             api_base=api_base,
             max_workers=max(4, max_workers // parallel_videos),
-            backend="server",
+            backend=backend,
         )
 
         try:
@@ -365,14 +419,22 @@ def evaluate(
             total_frames = result.get("total_frames", 0)
             fps = result.get("fps", 30.0)
 
-            iou = None
+            iou_soft = None
+            iou_hyst = None
             if ann.is_anomaly and total_frames > 0:
-                iou = compute_frame_iou(
-                    ann.intervals, entity_verdicts, total_frames, fps
+                iou_soft = compute_frame_iou(
+                    ann.intervals, entity_verdicts, total_frames, fps,
+                    temporal_signals=temporal_signals, mode="soft",
+                )
+                iou_hyst = compute_frame_iou(
+                    ann.intervals, entity_verdicts, total_frames, fps,
+                    temporal_signals=temporal_signals, mode="hysteresis",
                 )
 
             status = "✅" if pred_anomaly == ann.is_anomaly else "❌"
-            iou_str = f"IoU={iou:.3f}" if iou is not None else ""
+            iou_str = ""
+            if iou_soft is not None:
+                iou_str = f"SoftIoU={iou_soft:.3f} HystIoU={iou_hyst:.3f}"
             logger.info(
                 f"[{i+1}/{total}] {status} {ann.filename} "
                 f"GT={ann.is_anomaly} Pred={pred_anomaly} "
@@ -391,7 +453,9 @@ def evaluate(
                 "pred_score": pred_score,
                 "entity_verdicts": entity_verdicts,
                 "temporal_signals": temporal_signals,
-                "iou": iou,
+                "iou": iou_soft,
+                "iou_soft": iou_soft,
+                "iou_hysteresis": iou_hyst,
                 "fps": fps,
                 "total_frames": total_frames,
                 "time_sec": round(elapsed, 1),
@@ -509,26 +573,35 @@ def compute_metrics(results: list[dict]) -> dict:
     except Exception:
         pass
 
-    # IoU
-    ious = [r["iou"] for r in results if r.get("iou") is not None and r["iou"] > 0]
-    mean_iou = float(np.mean(ious)) if ious else 0.0
+    # IoU (Soft + Hysteresis)
+    ious_soft = [r["iou_soft"] for r in results
+                 if r.get("iou_soft") is not None and r["iou_soft"] > 0]
+    ious_hyst = [r["iou_hysteresis"] for r in results
+                 if r.get("iou_hysteresis") is not None and r["iou_hysteresis"] > 0]
+    mean_iou_soft = float(np.mean(ious_soft)) if ious_soft else 0.0
+    mean_iou_hyst = float(np.mean(ious_hyst)) if ious_hyst else 0.0
 
     # Per category
     cat_stats = {}
     for r in results:
         cat = r.get("category", "Unknown")
         if cat not in cat_stats:
-            cat_stats[cat] = {"total": 0, "correct": 0, "ious": []}
+            cat_stats[cat] = {"total": 0, "correct": 0,
+                              "ious_soft": [], "ious_hyst": []}
         cat_stats[cat]["total"] += 1
         if r.get("pred_anomaly") == r.get("gt_anomaly"):
             cat_stats[cat]["correct"] += 1
-        if r.get("iou") is not None:
-            cat_stats[cat]["ious"].append(r["iou"])
+        if r.get("iou_soft") is not None:
+            cat_stats[cat]["ious_soft"].append(r["iou_soft"])
+        if r.get("iou_hysteresis") is not None:
+            cat_stats[cat]["ious_hyst"].append(r["iou_hysteresis"])
 
     for cat, s in cat_stats.items():
         s["accuracy"] = round(s["correct"] / s["total"], 4) if s["total"] > 0 else 0
-        s["mean_iou"] = round(float(np.mean(s["ious"])), 4) if s["ious"] else 0.0
-        del s["ious"]
+        s["mean_iou_soft"] = round(float(np.mean(s["ious_soft"])), 4) if s["ious_soft"] else 0.0
+        s["mean_iou_hyst"] = round(float(np.mean(s["ious_hyst"])), 4) if s["ious_hyst"] else 0.0
+        del s["ious_soft"]
+        del s["ious_hyst"]
 
     return {
         "accuracy": round(accuracy, 4),
@@ -537,7 +610,9 @@ def compute_metrics(results: list[dict]) -> dict:
         "f1": round(f1, 4),
         "frame_auc": round(frame_auc, 4),
         "video_auc": round(video_auc, 4),
-        "mean_iou": round(mean_iou, 4),
+        "mean_iou": round(mean_iou_soft, 4),
+        "mean_iou_soft": round(mean_iou_soft, 4),
+        "mean_iou_hysteresis": round(mean_iou_hyst, 4),
         "tp": tp, "fn": fn, "fp": fp, "tn": tn,
         "total": total,
         "category_stats": cat_stats,
@@ -554,14 +629,16 @@ def print_metrics(metrics: dict):
     print(f"  F1 Score:              {metrics['f1']:.4f}")
     print(f"  ★ Frame-level AUC-ROC: {metrics.get('frame_auc', 0):.4f}")
     print(f"  Video-level AUC-ROC:   {metrics.get('video_auc', 0):.4f}")
-    print(f"  Mean Anomaly IoU:      {metrics['mean_iou']:.4f}")
+    print(f"  Mean Soft IoU:         {metrics.get('mean_iou_soft', 0):.4f}")
+    print(f"  Mean Hysteresis IoU:   {metrics.get('mean_iou_hysteresis', 0):.4f}")
     print(f"  TP={metrics['tp']}  FN={metrics['fn']}  FP={metrics['fp']}  TN={metrics['tn']}")
     print(f"  Total time: {metrics.get('total_time_sec', 0)}s "
           f"({metrics.get('avg_time_per_video', 0)}s/video)")
     print(f"\n  Per-category:")
     for cat, s in sorted(metrics.get("category_stats", {}).items()):
-        iou_str = f"IoU={s['mean_iou']:.3f}" if s.get("mean_iou") else ""
-        print(f"    {cat:<20} acc={s['accuracy']:.2f} ({s['correct']}/{s['total']}) {iou_str}")
+        iou_s = f"SoftIoU={s['mean_iou_soft']:.3f}" if s.get("mean_iou_soft") else ""
+        iou_h = f"HystIoU={s['mean_iou_hyst']:.3f}" if s.get("mean_iou_hyst") else ""
+        print(f"    {cat:<20} acc={s['accuracy']:.2f} ({s['correct']}/{s['total']}) {iou_s} {iou_h}")
     print(f"{'='*70}\n")
 
 
@@ -575,6 +652,8 @@ def main():
     parser.add_argument("--max-workers", type=int, default=16)
     parser.add_argument("--parallel", type=int, default=3,
                         help="Parallel video processing count")
+    parser.add_argument("--backend", default="server", choices=["server", "local"],
+                        help="Inference backend: server (vLLM API) or local (transformers)")
     parser.add_argument("--no-balanced", action="store_true",
                         help="Disable balanced anomaly/normal sampling")
     args = parser.parse_args()
@@ -588,6 +667,7 @@ def main():
         max_workers=args.max_workers,
         parallel_videos=args.parallel,
         balanced=not args.no_balanced,
+        backend=args.backend,
     )
 
 

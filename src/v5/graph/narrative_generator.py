@@ -83,6 +83,12 @@ class NarrativeGenerator:
                 parts.append("[Physical Signal]")
                 for alert in my_alerts[:3]:
                     parts.append(f"  - {alert.description}")
+                    if alert.peak_energy_time > 0:
+                        parts.append(
+                            f"    Peak kinetic energy at T={alert.peak_energy_time:.2f}s "
+                            f"(value={alert.peak_energy_value:.4f}), "
+                            f"burst interval=[{alert.burst_start_sec:.2f}s, {alert.burst_end_sec:.2f}s]"
+                        )
                 parts.append("")
 
         if drift_info and drift_info.get("max_drift", 0) > 0.15:

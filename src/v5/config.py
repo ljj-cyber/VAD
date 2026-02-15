@@ -26,19 +26,25 @@ class MotionConfig:
     """帧差动能 + 连通域提取配置"""
 
     # 帧差阈值 (0-255)，低于此值视为背景
-    diff_threshold: int = 25
+    diff_threshold: int = 18
+    # 自适应阈值回退：检测不到时自动降低 (最低阈值)
+    adaptive_threshold_min: int = 8
     # 形态学核大小 (去噪)
     morph_kernel_size: int = 5
     # 高斯模糊核 (预处理)
     blur_kernel_size: int = 5
     # 连通域最小面积 (像素数)，低于此值忽略
-    min_region_area: int = 1500
+    min_region_area: int = 600
     # 提取 Top-K 动能连通域 (增大以覆盖更多实体)
-    top_k_regions: int = 4
+    top_k_regions: int = 5
     # Crop padding 比例 (bbox 外扩)
     crop_padding_ratio: float = 0.15
     # 最小 crop 尺寸 (像素)
-    min_crop_size: int = 80
+    min_crop_size: int = 40
+    # 多帧累积缓冲区大小 (用于捕捉慢速运动)
+    accumulate_frames: int = 3
+    # 连续无检出帧数阈值 — 超过后自动降低阈值
+    empty_streak_for_fallback: int = 30
 
 
 class CLIPEncoderConfig:
@@ -62,8 +68,8 @@ class TrackerConfig:
     # 最大活跃实体数
     max_active_entities: int = 30
     # 新 Entity 的最小动能 (低于此值不分配新 ID)
-    # 提高以减少噪声实体 (0.04 → 0.06)
-    min_kinetic_for_new: float = 0.06
+    # 降低以捕捉更多实体 (0.06 → 0.03)
+    min_kinetic_for_new: float = 0.03
 
 
 # ── Stage 2: 稀疏语义挂载 ────────────────────────────
@@ -86,9 +92,16 @@ class SemanticVLLMConfig:
     """VLLM 语义推理 (仅对 crop 区域)"""
 
     # VLLM model
-    model_name: str = "qwen2-vl-7b"
+    model_name: str = "qwen2.5-vl-7b"
     MODEL_PATHS: dict = {
         "qwen2-vl-7b": "Qwen/Qwen2-VL-7B-Instruct",
+        "qwen2.5-vl-7b": "/data/liuzhe/Qwen2.5-VL-7B-Instruct",
+    }
+
+    # 本地模型路径 (用于 backend="local")
+    LOCAL_MODEL_PATHS: dict = {
+        "qwen2.5-vl-7b": "/data/liuzhe/Qwen2.5-VL-7B-Instruct",
+        "qwen2-vl-7b": str(HF_CACHE_DIR / "hub" / "models--Qwen--Qwen2-VL-7B-Instruct"),
     }
 
     # API server

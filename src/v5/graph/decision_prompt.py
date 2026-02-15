@@ -65,6 +65,10 @@ behavior is anomalous.
 Analyze the action sequence and temporal pattern. \
 Decide whether the observed behavior constitutes an anomaly based on the provided narrative.
 
+If the behavior IS anomalous, you MUST provide the precise time interval \
+(anomaly_start_sec, anomaly_end_sec) that covers the full anomalous segment. \
+Use the timestamps (T=...) from the narrative to determine the interval boundaries.
+
 Output ONLY valid JSON. No extra text.
 """
 
@@ -83,12 +87,15 @@ Output ONLY JSON:
 {{
   "is_anomaly": <true|false>,
   "confidence": <float 0.0-1.0>,
-  "break_timestamp": <float seconds where anomaly starts, or null>,
+  "anomaly_start_sec": <float — earliest second the anomaly begins, or 0.0 if normal>,
+  "anomaly_end_sec": <float — latest second the anomaly ends, or 0.0 if normal>,
   "reason": "<one-sentence explanation>",
   "is_cinematic_false_alarm": <true|false>
 }}
 
-- If is_anomaly=false, break_timestamp must be null.
+- If is_anomaly=false, anomaly_start_sec and anomaly_end_sec must both be 0.0.
+- anomaly_start_sec / anomaly_end_sec should tightly cover the anomalous behavior \
+observed in the narrative (use the T=... timestamps as reference).
 - confidence should reflect how certain you are.
 """
 
@@ -228,7 +235,8 @@ class DecisionAuditor:
             if v.is_anomaly and not v.is_cinematic_false_alarm:
                 summary_parts.append(
                     f"Entity #{v.entity_id}: {v.reason} "
-                    f"(conf={v.confidence:.2f}, T={v.break_timestamp})"
+                    f"(conf={v.confidence:.2f}, "
+                    f"interval=[{v.anomaly_start_sec:.1f}s, {v.anomaly_end_sec:.1f}s])"
                 )
 
         return VideoVerdict(
@@ -262,11 +270,24 @@ class DecisionAuditor:
             narrative=narrative,
         )
 
+        # 3. 收集该实体的 discordance 峰值信息
+        entity_discordance = None
+        if discordance_alerts:
+            my_alerts = [
+                a for a in discordance_alerts
+                if a.entity_id == entity_id and a.alert_type == "energy_semantic_gap"
+            ]
+            if my_alerts:
+                entity_discordance = my_alerts
+
         # 4. 调用 Decision LLM
         raw_response = self._call_llm(prompt)
 
-        # 5. 解析
-        verdict = self._parse_response(entity_id, raw_response, graph)
+        # 5. 解析（传入 discordance 峰值信息用于区间定位）
+        verdict = self._parse_response(
+            entity_id, raw_response, graph,
+            discordance_alerts=entity_discordance,
+        )
 
         logger.info(
             f"Entity #{entity_id}: anomaly={verdict.is_anomaly}, "
@@ -276,6 +297,12 @@ class DecisionAuditor:
         return verdict
 
     def _call_llm(self, prompt: str) -> str:
+        """调用 Decision LLM (支持 server / local 两种后端)"""
+        if self.vllm_cfg.backend == "local":
+            return self._call_llm_local(prompt)
+        return self._call_llm_server(prompt)
+
+    def _call_llm_server(self, prompt: str) -> str:
         """通过 vLLM server 调用 Decision LLM"""
         import httpx
 
@@ -306,6 +333,28 @@ class DecisionAuditor:
             logger.error(f"Decision LLM call failed: {e}")
             return self._rule_based_fallback(prompt)
 
+    def _call_llm_local(self, prompt: str) -> str:
+        """通过本地 Qwen2.5-VL 模型调用 Decision LLM (纯文本)"""
+        try:
+            from ..semantic.vllm_semantic import get_local_model, local_chat_inference
+
+            model, processor = get_local_model(self.vllm_cfg)
+
+            messages = [
+                {"role": "system", "content": DECISION_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+
+            result = local_chat_inference(
+                model, processor, messages,
+                max_new_tokens=self.cfg.decision_max_tokens,
+                temperature=self.cfg.decision_temperature,
+            )
+            return result
+        except Exception as e:
+            logger.error(f"Local Decision LLM call failed: {e}")
+            return self._rule_based_fallback(prompt)
+
     def _rule_based_fallback(self, prompt: str) -> str:
         """规则兜底"""
         text = prompt.lower()
@@ -328,7 +377,8 @@ class DecisionAuditor:
         return json.dumps({
             "is_anomaly": is_anomaly,
             "confidence": round(conf, 2),
-            "break_timestamp": None,
+            "anomaly_start_sec": 0.0,
+            "anomaly_end_sec": 0.0,
             "reason": f"Rule-based: {', '.join(reasons)}" if reasons else "No anomaly",
             "is_cinematic_false_alarm": False,
         })
@@ -338,8 +388,14 @@ class DecisionAuditor:
         entity_id: int,
         raw_response: str,
         graph: EntityGraph,
+        discordance_alerts: Optional[list] = None,
     ) -> AuditVerdict:
-        """解析 Decision LLM 响应"""
+        """
+        解析 Decision LLM 响应。
+
+        对于 discordance 检出的异常，用动能峰值时间定位区间，
+        而非完全依赖 LLM 给出的（可能不准确的）时间。
+        """
         import re
 
         parsed = None
@@ -370,6 +426,7 @@ class DecisionAuditor:
         reason = str(parsed.get("reason", ""))
         is_cinematic = bool(parsed.get("is_cinematic_false_alarm", False))
 
+        # ── 兼容: 仍然解析 break_timestamp (如果 LLM 仍然输出) ──
         break_ts = parsed.get("break_timestamp")
         if break_ts is not None:
             try:
@@ -377,32 +434,92 @@ class DecisionAuditor:
             except (TypeError, ValueError):
                 break_ts = None
 
-        # ── 精确估计异常区间 (v2: 围绕 break_timestamp 构建对称窗口) ──
+        # ── 直接从 LLM 响应解析异常区间 ──
         anomaly_start = 0.0
         anomaly_end = 0.0
+
         if is_anomaly:
-            # 新策略: 以 break_timestamp 为中心，向前后扩展
-            # 默认窗口: 前 3 秒，后到实体最后时间 + 3 秒
-            if break_ts is not None:
-                anomaly_start = max(0.0, break_ts - 3.0)
-                anomaly_end = break_ts + max(graph.total_duration * 0.5, 6.0)
-            else:
-                # 没有 break_ts 时，用实体全部时间段
-                anomaly_start = graph.birth_time
-                anomaly_end = graph.last_time + 3.0
+            # ══════════════════════════════════════════════════
+            # 优先级 1: discordance 动能峰值定位
+            # 当该实体有 discordance alert (物理-语义矛盾) 时,
+            # 用动能峰值时间和突发区间来锚定异常区间,
+            # 而非依赖 LLM 给出的时间(LLM 在 discordance 场景
+            # 下缺乏精确时间信息)
+            # ══════════════════════════════════════════════════
+            used_discordance_peak = False
+            if discordance_alerts:
+                # 取动能最大的 alert 作为主锚点
+                best_alert = max(
+                    discordance_alerts, key=lambda a: a.peak_energy_value
+                )
+                if best_alert.burst_end_sec > best_alert.burst_start_sec > 0:
+                    anomaly_start = best_alert.burst_start_sec
+                    anomaly_end = best_alert.burst_end_sec
+                    used_discordance_peak = True
+                    logger.info(
+                        f"Entity #{entity_id}: discordance peak-anchored interval "
+                        f"[{anomaly_start:.2f}, {anomaly_end:.2f}] "
+                        f"(peak={best_alert.peak_energy_time:.2f}s, "
+                        f"KE={best_alert.peak_energy_value:.4f})"
+                    )
+                elif best_alert.peak_energy_time > 0:
+                    # burst 区间无效，但有峰值时间 → 用峰值 ± 5s
+                    anomaly_start = max(0.0, best_alert.peak_energy_time - 5.0)
+                    anomaly_end = best_alert.peak_energy_time + 5.0
+                    used_discordance_peak = True
+                    logger.info(
+                        f"Entity #{entity_id}: discordance peak ± 5s interval "
+                        f"[{anomaly_start:.2f}, {anomaly_end:.2f}] "
+                        f"(peak={best_alert.peak_energy_time:.2f}s)"
+                    )
 
-            # 额外扩展：考虑可疑节点的时间范围
-            suspicious_times = [
-                node.timestamp for node in graph.nodes
-                if node.is_suspicious or node.danger_score >= 0.3
-            ]
-            if suspicious_times:
-                anomaly_start = min(anomaly_start, min(suspicious_times) - 2.0)
-                anomaly_end = max(anomaly_end, max(suspicious_times) + 5.0)
+            # ══════════════════════════════════════════════════
+            # 优先级 2: LLM 直接输出的区间 (非 discordance 时)
+            # ══════════════════════════════════════════════════
+            if not used_discordance_peak:
+                raw_start = parsed.get("anomaly_start_sec")
+                raw_end = parsed.get("anomaly_end_sec")
 
+                llm_start = None
+                llm_end = None
+                if raw_start is not None:
+                    try:
+                        llm_start = float(raw_start)
+                    except (TypeError, ValueError):
+                        pass
+                if raw_end is not None:
+                    try:
+                        llm_end = float(raw_end)
+                    except (TypeError, ValueError):
+                        pass
+
+                if llm_start is not None and llm_end is not None and llm_end > llm_start:
+                    anomaly_start = max(0.0, llm_start)
+                    anomaly_end = llm_end
+                    logger.debug(
+                        f"Entity #{entity_id}: LLM interval "
+                        f"[{anomaly_start:.2f}, {anomaly_end:.2f}]"
+                    )
+                else:
+                    # Fallback: 用实体可疑节点时间范围
+                    suspicious_times = [
+                        node.timestamp for node in graph.nodes
+                        if node.is_suspicious or node.danger_score >= 0.3
+                    ]
+                    if suspicious_times:
+                        anomaly_start = max(0.0, min(suspicious_times) - 2.0)
+                        anomaly_end = max(suspicious_times) + 5.0
+                    else:
+                        anomaly_start = graph.birth_time
+                        anomaly_end = graph.last_time + 3.0
+
+                    logger.debug(
+                        f"Entity #{entity_id}: fallback interval "
+                        f"[{anomaly_start:.2f}, {anomaly_end:.2f}]"
+                    )
+
+            # 安全校验
             anomaly_start = max(0.0, anomaly_start)
-
-            # 确保 start < end
             if anomaly_end <= anomaly_start:
                 anomaly_end = anomaly_start + 6.0
 

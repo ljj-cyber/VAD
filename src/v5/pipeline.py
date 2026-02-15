@@ -72,7 +72,12 @@ class TubeSkeletonPipeline:
         vllm_cfg.api_base = api_base
         vllm_cfg.max_workers = max_workers
         self.semantic_vllm = SemanticVLLM(vllm_cfg)
-        self.discordance_checker = DiscordanceChecker()
+        self.discordance_checker = DiscordanceChecker(
+            sigma_multiplier=5.0,
+            min_energy_threshold=0.15,
+            min_excess_ratio=2.5,
+            voting_suppress_ratio=0.5,
+        )
         self.global_heartbeat = GlobalHeartbeat(heartbeat_sec=2.5, drift_threshold=0.18)
 
         # Stage 3
@@ -264,11 +269,16 @@ class TubeSkeletonPipeline:
 
         # ── Stage 2: 矛盾检测 ──
         entity_trace_energies: dict[int, list[float]] = {}
+        entity_trace_time_energy: dict[int, list[tuple[float, float]]] = {}
         for eid, entries in entity_trace_buffer.items():
             entity_trace_energies[eid] = [e.kinetic_energy for e in entries]
+            entity_trace_time_energy[eid] = [
+                (e.timestamp, e.kinetic_energy) for e in entries
+            ]
 
         discordance_alerts = self.discordance_checker.check_video(
-            semantic_results, entity_trace_energies
+            semantic_results, entity_trace_energies,
+            entity_trace_time_energy=entity_trace_time_energy,
         )
 
         # CLIP 漂移信息
