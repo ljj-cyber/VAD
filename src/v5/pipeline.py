@@ -249,12 +249,11 @@ class TubeSkeletonPipeline:
             f"{t_tracking - t_start:.1f}s"
         )
 
-        # ── Stage 2: 批量 VLLM 语义推理 (带框全图) ──
-        # grid_images 已生成但暂不激活（多帧拼图模式实验性功能）
+        # ── Stage 2: 批量 VLLM 语义推理 (带框全图 + 多帧拼图) ──
         semantic_results = self.semantic_vllm.infer_triggers(
             all_triggers,
             painted_images=painted_images,
-            # grid_images=grid_images,  # 可选：启用多帧拼图模式
+            grid_images=grid_images,
         )
 
         t_semantic = time.time()
@@ -312,6 +311,34 @@ class TubeSkeletonPipeline:
             f"({verdict.confidence:.2f})"
         )
 
+        # ── 构建 danger_timeline: 所有语义节点的 (timestamp, danger_score) ──
+        danger_timeline = []
+        for sr in semantic_results:
+            danger_timeline.append({
+                "timestamp": round(sr.get("timestamp", 0.0), 3),
+                "danger_score": round(sr.get("danger_score", 0.0), 4),
+                "is_suspicious": sr.get("is_suspicious", False),
+                "entity_id": sr.get("entity_id", -1),
+                "action": sr.get("action", "unknown"),
+            })
+        danger_timeline.sort(key=lambda x: x["timestamp"])
+
+        # ── 构建帧级动能时间线 (下采样到每秒) ──
+        energy_per_sec = []
+        if all_frame_energies:
+            sec_bins = int(video_duration) + 1
+            for s in range(sec_bins):
+                frame_start = int(s * fps / sample_every_n)
+                frame_end = int((s + 1) * fps / sample_every_n)
+                bin_energies = all_frame_energies[frame_start:frame_end]
+                if bin_energies:
+                    energy_per_sec.append(round(max(bin_energies), 4))
+                else:
+                    energy_per_sec.append(0.0)
+
+        # ── 心跳漂移时间线 ──
+        drift_timeline = self.global_heartbeat.get_drift_timeline()
+
         # ── 构建输出 ──
         result = {
             "video_path": str(video_path),
@@ -337,6 +364,15 @@ class TubeSkeletonPipeline:
                     }
                     for v in verdict.entity_verdicts
                 ],
+            },
+            "temporal_signals": {
+                "danger_timeline": danger_timeline,
+                "energy_per_sec": energy_per_sec,
+                "drift_timeline": [
+                    {"timestamp": round(t, 3), "drift": round(d, 4)}
+                    for t, d in drift_timeline
+                ],
+                "heartbeat_frames": heartbeat_frames,
             },
             "timing": {
                 "tracking_sec": round(t_tracking - t_start, 2),

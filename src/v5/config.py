@@ -32,9 +32,9 @@ class MotionConfig:
     # 高斯模糊核 (预处理)
     blur_kernel_size: int = 5
     # 连通域最小面积 (像素数)，低于此值忽略
-    min_region_area: int = 1200
-    # 提取 Top-K 动能连通域
-    top_k_regions: int = 2
+    min_region_area: int = 1500
+    # 提取 Top-K 动能连通域 (增大以覆盖更多实体)
+    top_k_regions: int = 4
     # Crop padding 比例 (bbox 外扩)
     crop_padding_ratio: float = 0.15
     # 最小 crop 尺寸 (像素)
@@ -54,13 +54,16 @@ class TrackerConfig:
     """Entity Tracker 贪婪匹配配置"""
 
     # 余弦相似度阈值：高于此值 → 沿用旧 ID
-    similarity_threshold: float = 0.82
+    # 降低阈值以减少实体碎片化 (0.82 → 0.72)
+    similarity_threshold: float = 0.72
     # 最大允许的帧间隔（超过则 Entity 死亡）
-    max_age_frames: int = 30
+    # 增大以让实体存活更久 (30 → 150)
+    max_age_frames: int = 150
     # 最大活跃实体数
-    max_active_entities: int = 20
+    max_active_entities: int = 30
     # 新 Entity 的最小动能 (低于此值不分配新 ID)
-    min_kinetic_for_new: float = 0.04
+    # 提高以减少噪声实体 (0.04 → 0.06)
+    min_kinetic_for_new: float = 0.06
 
 
 # ── Stage 2: 稀疏语义挂载 ────────────────────────────
@@ -70,8 +73,10 @@ class NodeTriggerConfig:
     # Rule 1: Birth — 新 ID 出现即触发
     trigger_on_birth: bool = True
     # Rule 2: Change Point — 与上次采样的 embedding 距离阈值
-    embedding_jump_threshold: float = 0.25  # 1 - cosine_similarity
+    # 降低以对火焰/烟雾等渐变信号更敏感 (0.30 → 0.22)
+    embedding_jump_threshold: float = 0.22  # 1 - cosine_similarity
     # Rule 3: Heartbeat — 距上次采样最大间隔 (秒)
+    # 缩短以增加 Arson 等慢变场景的采样密度 (5.0 → 3.0)
     heartbeat_interval_sec: float = 3.0
     # 最大触发频率保护 (同一实体相邻触发的最小间隔帧数)
     min_trigger_gap_frames: int = 5
@@ -126,33 +131,12 @@ class DecisionConfig:
     # VLLM 决策推理参数
     decision_max_tokens: int = 384
     decision_temperature: float = 0.0
-    max_audit_entities: int = 8
+    # 增大审计容量以覆盖更多实体 (8 → 12)
+    max_audit_entities: int = 12
 
-    # 业务契约
+    # 业务契约 — 已清空，让模型零先验判断
     business_contracts: dict = {
-        "retail store": [
-            "拿起物品后，必须在离开前完成结账操作",
-            "高速奔跑且携带物品，判定为可疑行为",
-        ],
-        "supermarket": [
-            "拿起物品后，必须在离开前完成结账操作",
-            "高速奔跑且携带物品，判定为可疑行为",
-        ],
-        "street": [
-            "突然改变方向并加速奔跑，需要关注",
-            "持续追赶他人，判定为攻击性行为",
-            "多人围殴单人，判定为暴力行为",
-        ],
-        "parking lot": [
-            "未经开锁直接进入车辆，判定为可疑行为",
-            "长时间在多辆车之间徘徊，需要关注",
-        ],
-        "default": [
-            "非休息区蹲下超过 10 秒 = 异常",
-            "拿取物品后未结账即离开 = 异常",
-            "动作序列出现不合逻辑的突变，需要审查",
-            "出现暴力/纵火/持械行为，判定为异常",
-        ],
+        "default": [],
     }
 
     # 异常置信度阈值

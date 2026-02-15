@@ -22,31 +22,13 @@ logger = logging.getLogger(__name__)
 
 
 def _kinetic_label(value: float) -> str:
-    """动能等级标签"""
-    if value < 0.005:
-        return "极低"
-    elif value < 0.02:
-        return "低"
-    elif value < 0.08:
-        return "中等"
-    elif value < 0.2:
-        return "高"
-    else:
-        return "极高"
+    """动能等级标签 — 仅返回数值，不做解释"""
+    return ""
 
 
 def _danger_label(score: float) -> str:
-    """危险度标签"""
-    if score < 0.2:
-        return ""
-    elif score < 0.4:
-        return " [mildly unusual]"
-    elif score < 0.6:
-        return " [SUSPICIOUS]"
-    elif score < 0.8:
-        return " [DANGEROUS]"
-    else:
-        return " [EXTREME DANGER]"
+    """危险度标签 — 仅返回数值，不做解释"""
+    return ""
 
 
 class NarrativeGenerator:
@@ -98,20 +80,16 @@ class NarrativeGenerator:
             my_alerts = [a for a in discordance_alerts if a.entity_id == eid or a.entity_id == -1]
             if my_alerts:
                 has_physics_warning = True
-                parts.append("[Physical Signal — for reference only, not proof of anomaly]")
-                parts.append("The motion sensor detected unusual energy levels:")
+                parts.append("[Physical Signal]")
                 for alert in my_alerts[:3]:
                     parts.append(f"  - {alert.description}")
-                parts.append("(Note: high motion energy can be caused by normal activities.)")
                 parts.append("")
 
         if drift_info and drift_info.get("max_drift", 0) > 0.15:
             has_physics_warning = True
             parts.append(
                 f"[Physical Signal — Scene Change] "
-                f"Global visual appearance changed significantly "
-                f"(drift={drift_info['max_drift']:.3f}). "
-                f"This could indicate fire, explosion, lighting change, or camera adjustment."
+                f"drift={drift_info['max_drift']:.3f}"
             )
             parts.append("")
 
@@ -129,7 +107,7 @@ class NarrativeGenerator:
             line += _danger_label(node.danger_score)
 
             if node.is_suspicious:
-                line += " ⚠️ SUSPICIOUS"
+                line += " [flagged]"
 
             line += f"  (trigger: {node.trigger_rule})"
             parts.append(line)
@@ -206,7 +184,7 @@ class NarrativeGenerator:
                 f"{g.num_nodes} obs, "
                 f"max_danger={g.max_danger_score:.2f}, "
                 f"actions=[{action_str}]"
-                + (" ⚠️" if g.has_suspicious else "")
+                + (" [flagged]" if g.has_suspicious else "")
             )
 
         return "\n".join(lines)

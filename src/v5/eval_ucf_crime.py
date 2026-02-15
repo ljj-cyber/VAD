@@ -16,6 +16,7 @@ import logging
 import os
 import time
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
@@ -23,8 +24,10 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-# ── 日志 ──
-_log_dir = "/data/liuzhe/EventVAD/output/v5/eval_ucf_crime"
+# ── 日志（以时间戳命名，避免覆盖） ──
+_log_base = "/data/liuzhe/EventVAD/output/v5/eval_ucf_crime"
+_run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+_log_dir = f"{_log_base}/run_{_run_ts}"
 os.makedirs(_log_dir, exist_ok=True)
 
 logging.basicConfig(
@@ -134,63 +137,141 @@ def compute_frame_scores(
     video_confidence: float,
     total_frames: int,
     fps: float,
+    temporal_signals: dict = None,
 ) -> np.ndarray:
     """
-    将动态图审计的 [T1, T2] 异常结论广播到该区间内的所有帧。
+    多信号融合帧级异常分数生成器 (v2)。
 
-    策略:
-      1. 核心区间 [start, end]：所有帧获得满分 (confidence)
-      2. 前后渐变区 (ramp)：用线性衰减平滑过渡，避免硬边界
-      3. 多个异常实体的分数取 max 叠加
-      4. 如果视频被判异常但没有精确区间，给全视频一个低底分
+    三路信号融合:
+      Signal 1: 实体审计区间 (entity_verdicts → 区间广播)
+      Signal 2: 语义危险时间线 (danger_timeline → 高斯核扩散)
+      Signal 3: 帧级动能异常 (energy_per_sec → 自适应阈值)
+
+    最终分数 = max(signal_1, 0.6*signal_2 + 0.4*signal_3) 然后高斯平滑。
     """
+    try:
+        from scipy.ndimage import gaussian_filter1d
+        _has_scipy = True
+    except ImportError:
+        _has_scipy = False
+
     scores = np.zeros(total_frames, dtype=np.float32)
 
-    ramp_sec = 4.0   # 渐变区秒数（前后各 4 秒线性衰减）
+    if not temporal_signals:
+        temporal_signals = {}
 
-    any_anomaly = False
+    # ═══════════════════════════════════════════════════════
+    # Signal 1: 实体审计区间 (与之前类似但更保守)
+    # ═══════════════════════════════════════════════════════
+    sig1 = np.zeros(total_frames, dtype=np.float32)
+    ramp_sec = 5.0
+
+    any_entity_anomaly = False
     for v in entity_verdicts:
         if not v.get("is_anomaly", False):
             continue
 
-        any_anomaly = True
+        any_entity_anomaly = True
         conf = float(v.get("confidence", video_confidence))
         start_sec = float(v.get("anomaly_start_sec", 0.0))
         end_sec = float(v.get("anomaly_end_sec", 0.0))
 
         if end_sec <= start_sec:
-            # 没有精确区间，跳过（后面会给底分）
             continue
 
-        # ── 核心区间：全部帧满分 ──
-        core_sf = int(start_sec * fps)
-        core_ef = int(end_sec * fps)
-        core_sf = max(0, min(core_sf, total_frames))
-        core_ef = max(0, min(core_ef, total_frames))
+        core_sf = max(0, min(int(start_sec * fps), total_frames))
+        core_ef = max(0, min(int(end_sec * fps), total_frames))
 
         if core_sf < core_ef:
-            scores[core_sf:core_ef] = np.maximum(
-                scores[core_sf:core_ef], conf
-            )
+            sig1[core_sf:core_ef] = np.maximum(sig1[core_sf:core_ef], conf)
 
-        # ── 前渐变区：线性从 0 升到 conf ──
+        # 前后渐变
         ramp_frames = int(ramp_sec * fps)
         ramp_sf = max(0, core_sf - ramp_frames)
         if ramp_sf < core_sf:
             n = core_sf - ramp_sf
-            ramp_values = np.linspace(conf * 0.15, conf * 0.85, n, dtype=np.float32)
-            scores[ramp_sf:core_sf] = np.maximum(scores[ramp_sf:core_sf], ramp_values)
+            ramp_values = np.linspace(conf * 0.1, conf * 0.8, n, dtype=np.float32)
+            sig1[ramp_sf:core_sf] = np.maximum(sig1[ramp_sf:core_sf], ramp_values)
 
-        # ── 后渐变区：线性从 conf 降到 0 ──
         ramp_ef = min(total_frames, core_ef + ramp_frames)
         if core_ef < ramp_ef:
             n = ramp_ef - core_ef
-            ramp_values = np.linspace(conf * 0.85, conf * 0.15, n, dtype=np.float32)
-            scores[core_ef:ramp_ef] = np.maximum(scores[core_ef:ramp_ef], ramp_values)
+            ramp_values = np.linspace(conf * 0.8, conf * 0.1, n, dtype=np.float32)
+            sig1[core_ef:ramp_ef] = np.maximum(sig1[core_ef:ramp_ef], ramp_values)
 
-    # ── 如果有异常但没有精确区间，给全视频低底分 ──
-    if any_anomaly and scores.max() == 0:
-        scores[:] = video_confidence * 0.3
+    # ═══════════════════════════════════════════════════════
+    # Signal 2: 语义危险时间线 (danger_score 高斯扩散)
+    # ═══════════════════════════════════════════════════════
+    sig2 = np.zeros(total_frames, dtype=np.float32)
+    danger_timeline = temporal_signals.get("danger_timeline", [])
+    if danger_timeline:
+        for dt in danger_timeline:
+            ts = float(dt.get("timestamp", 0.0))
+            ds = float(dt.get("danger_score", 0.0))
+            is_susp = dt.get("is_suspicious", False)
+
+            if ds < 0.1 and not is_susp:
+                continue
+
+            # 在该时间点周围放置高斯脉冲
+            center_frame = int(ts * fps)
+            if 0 <= center_frame < total_frames:
+                # 脉冲强度 = danger_score，宽度根据 danger_score 自适应
+                pulse_strength = ds
+                if is_susp:
+                    pulse_strength = max(pulse_strength, 0.3)
+
+                sigma_frames = int(3.0 * fps)  # 3秒 sigma
+                radius = int(4 * sigma_frames)
+                for f in range(max(0, center_frame - radius), min(total_frames, center_frame + radius)):
+                    dist = abs(f - center_frame)
+                    gauss_val = pulse_strength * np.exp(-0.5 * (dist / max(sigma_frames, 1)) ** 2)
+                    sig2[f] = max(sig2[f], gauss_val)
+
+    # ═══════════════════════════════════════════════════════
+    # Signal 3: 帧级动能异常 (energy_per_sec 自适应)
+    # ═══════════════════════════════════════════════════════
+    sig3 = np.zeros(total_frames, dtype=np.float32)
+    energy_per_sec = temporal_signals.get("energy_per_sec", [])
+    if energy_per_sec and len(energy_per_sec) > 5:
+        energies = np.array(energy_per_sec, dtype=np.float64)
+        # 自适应阈值: μ + 2σ
+        mu = energies.mean()
+        sigma = energies.std()
+        threshold = mu + 2.0 * sigma
+
+        for sec_idx, e in enumerate(energies):
+            if e > threshold and threshold > 0:
+                excess = min((e - threshold) / max(threshold, 1e-6), 3.0) / 3.0
+                # 广播到该秒对应的所有帧
+                sf = int(sec_idx * fps)
+                ef = min(int((sec_idx + 1) * fps), total_frames)
+                sig3[sf:ef] = np.maximum(sig3[sf:ef], excess * 0.5)
+
+    # ═══════════════════════════════════════════════════════
+    # 融合: scores = max(sig1, w2*sig2 + w3*sig3)
+    # ═══════════════════════════════════════════════════════
+    sig_combined = 0.65 * sig2 + 0.35 * sig3
+
+    # 如果视频被判异常，用 video_confidence 对 sig_combined 加权
+    if any_entity_anomaly and video_confidence > 0:
+        sig_combined *= video_confidence
+
+    scores = np.maximum(sig1, sig_combined)
+
+    # ═══════════════════════════════════════════════════════
+    # 高斯平滑 (σ = 2秒)
+    # ═══════════════════════════════════════════════════════
+    if total_frames > 10 and _has_scipy:
+        smooth_sigma = max(1, int(2.0 * fps))
+        scores = gaussian_filter1d(scores, sigma=smooth_sigma).astype(np.float32)
+
+    # ── 如果视频判异常但所有信号都为0，给全视频低底分 ──
+    if any_entity_anomaly and scores.max() < 0.01:
+        scores[:] = video_confidence * 0.2
+
+    # 裁剪到 [0, 1]
+    scores = np.clip(scores, 0.0, 1.0)
 
     return scores
 
@@ -279,6 +360,7 @@ def evaluate(
             pred_anomaly = verdict.get("is_anomaly", False)
             pred_score = verdict.get("confidence", 0.0)
             entity_verdicts = verdict.get("entity_verdicts", [])
+            temporal_signals = result.get("temporal_signals", {})
 
             total_frames = result.get("total_frames", 0)
             fps = result.get("fps", 30.0)
@@ -308,6 +390,7 @@ def evaluate(
                 "pred_anomaly": pred_anomaly,
                 "pred_score": pred_score,
                 "entity_verdicts": entity_verdicts,
+                "temporal_signals": temporal_signals,
                 "iou": iou,
                 "fps": fps,
                 "total_frames": total_frames,
@@ -338,6 +421,9 @@ def evaluate(
     metrics["avg_time_per_video"] = round(total_time / max(len(results), 1), 1)
     metrics["sample_every"] = sample_every
     metrics["parallel_videos"] = parallel_videos
+    metrics["max_videos"] = max_videos
+    metrics["run_timestamp"] = _run_ts
+    metrics["run_dir"] = str(_log_dir)
 
     # ── 打印 ──
     print_metrics(metrics)
@@ -346,16 +432,27 @@ def evaluate(
     out_dir = Path(_log_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 清理不可序列化的字段
+    # 清理不可序列化的字段和过大字段
     clean_results = []
     for r in results:
-        cr = {k: v for k, v in r.items()}
+        cr = {k: v for k, v in r.items() if k != "temporal_signals"}
         clean_results.append(cr)
 
-    with open(out_dir / "results_v5.json", "w", encoding="utf-8") as f:
+    results_path = out_dir / "results_v5.json"
+    with open(results_path, "w", encoding="utf-8") as f:
         json.dump({"metrics": metrics, "details": clean_results}, f, indent=2, ensure_ascii=False)
 
-    logger.info(f"\nResults saved to {out_dir / 'results_v5.json'}")
+    # 创建/更新 latest 软链接，方便快速查看最新结果
+    latest_link = Path(_log_base) / "latest"
+    try:
+        if latest_link.is_symlink() or latest_link.exists():
+            latest_link.unlink()
+        latest_link.symlink_to(out_dir)
+    except OSError:
+        pass  # 软链接创建失败不影响主流程
+
+    logger.info(f"\nResults saved to {results_path}")
+    logger.info(f"Run directory: {out_dir}")
     return metrics
 
 
@@ -391,6 +488,7 @@ def compute_metrics(results: list[dict]) -> dict:
                 r.get("entity_verdicts", []),
                 r.get("pred_score", 0.0),
                 tf, fps,
+                temporal_signals=r.get("temporal_signals", {}),
             )
             all_gt.extend(gt_mask.astype(int).tolist())
             all_pred.extend(pred_scores.tolist())

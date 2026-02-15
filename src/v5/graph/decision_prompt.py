@@ -57,52 +57,28 @@ class VideoVerdict:
 # ── Prompt Templates ──────────────────────────────────
 
 DECISION_SYSTEM_PROMPT = """\
-You are a Decision Audit Expert for a video anomaly detection system.
+You are a decision module for a surveillance video anomaly detection system.
 
 Your task: Given an entity's behavior trajectory narrative, determine if the \
-behavior is anomalous by analyzing:
+behavior is anomalous.
 
-1. **Semantic Logic**: Does the action sequence follow normal causal relations?
-   e.g., In a store: "pick up item" should be followed by "checkout" before "leave".
-2. **Kinetic Physics**: Does the kinetic energy match the action semantics?
-   e.g., "standing still" suddenly becoming "sprinting" with energy surge is suspicious.
-3. **Temporal Pattern**: Are there abnormally long pauses or sudden accelerations?
-4. **Cinematic Filter**: If footage appears to be from a movie/TV (cinematic), \
-   mark as false alarm.
+Analyze the action sequence and temporal pattern. \
+Decide whether the observed behavior constitutes an anomaly based on the provided narrative.
 
 Output ONLY valid JSON. No extra text.
 """
 
 DECISION_USER_TEMPLATE = """\
 ## Scenario: {scene_type}
-{scene_priors}
-
-## Business Contracts (Rules for this scenario):
-{contracts}
 
 ## Entity Behavior Narrative:
 {narrative}
 
 ---
 
-IMPORTANT — How to interpret evidence:
+Based on the above narrative, determine whether this entity's behavior is anomalous.
 
-[Physical Signal] = camera detected significant pixel changes (motion energy). \
-  This ONLY means the image changed, NOT that behavior is illegal. \
-  Normal causes: person walking, car passing, door opening, wind, lighting change. \
-  Abnormal causes: explosion, fire spreading, sudden violent movement.
-
-[Semantic Observation] = what the entity appears to be DOING based on visual analysis.
-
-DECISION RULE: \
-  You must INDEPENDENTLY evaluate the [Semantic Observation] first. \
-  Only if the ACTION LOGIC is abnormal (e.g., fighting, forced entry, fire, \
-  stealing without checkout) should you consider the physical signal as \
-  supporting evidence. \
-  DO NOT flag as anomaly simply because motion energy is high — \
-  most high-energy motion is normal (walking, running for exercise, etc.).
-
-Analyze this entity's behavior. Output ONLY JSON:
+Output ONLY JSON:
 
 {{
   "is_anomaly": <true|false>,
@@ -116,19 +92,8 @@ Analyze this entity's behavior. Output ONLY JSON:
 - confidence should reflect how certain you are.
 """
 
-# 场景先验知识 — 让 LLM 自动激活领域知识
-SCENE_PRIORS = {
-    "gas station": "Prior: Flammable environment. Any fire, smoke, or spark is CRITICAL.",
-    "parking lot": "Prior: Vehicle theft and break-ins are common. Watch for forced entry or loitering.",
-    "store": "Prior: Shoplifting pattern = pick up item → leave without checkout.",
-    "supermarket": "Prior: Shoplifting pattern = pick up item → leave without checkout.",
-    "street": "Prior: Watch for fighting, chasing, hit-and-run, or mob violence.",
-    "corridor": "Prior: Restricted access. Unauthorized entry or loitering is suspicious.",
-    "bank": "Prior: Any threatening gesture, weapon, or forced entry is CRITICAL.",
-    "atm": "Prior: Robbery risk. Watch for threatening behavior or forced card usage.",
-    "road": "Prior: Watch for car accidents, hit-and-run, reckless driving.",
-    "house": "Prior: Break-in risk. Watch for forced entry through windows or doors.",
-}
+# 场景先验知识 — 已移除，让模型零先验判断
+SCENE_PRIORS = {}
 
 
 class DecisionAuditor:
@@ -291,24 +256,9 @@ class DecisionAuditor:
             drift_info=drift_info,
         )
 
-        # 2. 获取契约
-        contracts = self._get_contracts(scene_type)
-
-        # 3. 获取场景先验知识
-        scene_lower = scene_type.lower().strip()
-        scene_priors = ""
-        for key, prior in SCENE_PRIORS.items():
-            if key in scene_lower or scene_lower in key:
-                scene_priors = prior
-                break
-        if not scene_priors:
-            scene_priors = "Prior: General surveillance. Watch for violence, theft, fire, or unauthorized access."
-
-        # 4. 构建 prompt
+        # 2. 构建 prompt（无先验知识注入）
         prompt = DECISION_USER_TEMPLATE.format(
             scene_type=scene_type or "unknown",
-            scene_priors=scene_priors,
-            contracts=contracts,
             narrative=narrative,
         )
 
@@ -427,31 +377,34 @@ class DecisionAuditor:
             except (TypeError, ValueError):
                 break_ts = None
 
-        # ── 精确估计异常区间：广播到实体的完整活跃时间段 ──
+        # ── 精确估计异常区间 (v2: 围绕 break_timestamp 构建对称窗口) ──
         anomaly_start = 0.0
         anomaly_end = 0.0
         if is_anomaly:
-            # 策略：从 break_timestamp 开始到实体最后出现时间
-            # 如果没有 break_ts，用实体 birth_time 到 last_time
+            # 新策略: 以 break_timestamp 为中心，向前后扩展
+            # 默认窗口: 前 3 秒，后到实体最后时间 + 3 秒
             if break_ts is not None:
-                anomaly_start = max(0.0, break_ts - 1.0)
+                anomaly_start = max(0.0, break_ts - 3.0)
+                anomaly_end = break_ts + max(graph.total_duration * 0.5, 6.0)
             else:
+                # 没有 break_ts 时，用实体全部时间段
                 anomaly_start = graph.birth_time
+                anomaly_end = graph.last_time + 3.0
 
-            anomaly_end = graph.last_time
+            # 额外扩展：考虑可疑节点的时间范围
+            suspicious_times = [
+                node.timestamp for node in graph.nodes
+                if node.is_suspicious or node.danger_score >= 0.3
+            ]
+            if suspicious_times:
+                anomaly_start = min(anomaly_start, min(suspicious_times) - 2.0)
+                anomaly_end = max(anomaly_end, max(suspicious_times) + 5.0)
 
-            # 额外扩展：向前回溯到最早的可疑节点
-            for node in graph.nodes:
-                if node.is_suspicious or node.danger_score >= 0.2:
-                    anomaly_start = min(anomaly_start, node.timestamp)
-
-            # 向后扩展：如果最后一个节点就是可疑的，向后多延伸 5 秒
-            if graph.nodes and (graph.nodes[-1].is_suspicious or graph.nodes[-1].danger_score >= 0.2):
-                anomaly_end = graph.last_time + 5.0
+            anomaly_start = max(0.0, anomaly_start)
 
             # 确保 start < end
             if anomaly_end <= anomaly_start:
-                anomaly_end = anomaly_start + 3.0
+                anomaly_end = anomaly_start + 6.0
 
         return AuditVerdict(
             entity_id=entity_id,

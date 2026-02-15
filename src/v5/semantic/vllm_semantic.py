@@ -32,45 +32,32 @@ logger = logging.getLogger(__name__)
 # ── Prompt ────────────────────────────────────────────
 
 CROP_SYSTEM_PROMPT = """\
-You are a surveillance video analyst. You are given a full surveillance frame \
-with RED/YELLOW bounding boxes highlighting the main moving entities detected \
-by motion analysis. Analyze the scene in two steps.
+You are a video frame observer. You are given a surveillance frame \
+with RED/YELLOW bounding boxes highlighting detected moving entities. \
+Describe ONLY what you can clearly see — report any safety-relevant observations.
 
 Rules:
-- STEP 1 — "box_action": Describe WHAT the highlighted entity is doing. \
-  Use precise verbs: walking, running, fighting, crouching, carrying, bending, \
-  setting fire, climbing, lying on ground, gesturing, etc.
-- STEP 2 — "context_relation": Describe the RELATIONSHIP between the entity's \
-  action and the surrounding environment. Is there fire nearby? A vehicle? \
-  A store? Other people? Is the entity interacting with them?
-- "scene_type": the overall scene (street, parking lot, store, gas station, etc.)
-- "is_suspicious": Set to true if ANYTHING seems unusual, even slightly. \
-  This is a LOW threshold — being cautious is better than missing danger. \
-  Examples: crouching near a car at night, running away from a scene, \
-  someone lying on the ground, fire/smoke visible, unusual gathering.
-- "danger_score": \
-  0.0 = clearly normal (walking, standing, shopping). \
-  0.1 = mildly unusual but probably harmless (loitering, crouching). \
-  0.3 = noteworthy (running away, aggressive gesture, smoke visible). \
-  0.5 = suspicious (fighting, forced entry, fire, chasing). \
-  0.7 = clearly dangerous (active violence, large fire, weapons visible). \
-  1.0 = extreme (shooting, explosion, mass violence).
+- "box_action": Describe the visible action of the highlighted entity. Only state what is observable.
+- "context_relation": Describe the visible surroundings. Only mention what you can actually see.
+- "scene_type": the overall scene type (e.g. indoor, outdoor, road, etc.).
+- "is_suspicious": true or false — based purely on what you observe, without assumptions.
+- "danger_score": a float 0.0-1.0 reflecting how unusual the observed behavior appears.
 - Output ONLY JSON, no extra text.
 """
 
 CROP_USER_PROMPT = """\
-Analyze this surveillance frame at T={timestamp:.2f}s. \
+Observe this frame at T={timestamp:.2f}s. \
 Red/yellow boxes highlight detected motion regions.
 
-Answer in TWO steps, then score. Output ONLY JSON:
+Describe what you see. Output ONLY JSON:
 
 {{
   "box_action": "<what is the highlighted entity doing?>",
-  "context_relation": "<how does this relate to the surroundings?>",
-  "action": "<precise atomic action verb>",
+  "context_relation": "<visible surroundings>",
+  "action": "<atomic action verb>",
   "action_object": "<object being interacted with, or none>",
   "posture": "<body posture>",
-  "scene_context": "<surrounding environment type>",
+  "scene_context": "<environment type>",
   "is_suspicious": <true|false>,
   "danger_score": <float 0.0-1.0>
 }}
@@ -78,35 +65,30 @@ Answer in TWO steps, then score. Output ONLY JSON:
 
 # ── 多帧拼图模式 Prompt ──
 GRID_SYSTEM_PROMPT = """\
-You are a surveillance video analyst. You are given a 2×2 grid of 4 consecutive \
+You are a video frame observer. You are given a 2×2 grid of 4 consecutive \
 surveillance frames showing the SAME scene over a short time period. \
 The 4 frames are arranged chronologically: top-left is oldest, bottom-right is newest.
 
-Your task: analyze the TEMPORAL CHANGE across these 4 frames.
+Your task: describe the TEMPORAL CHANGE across these 4 frames.
 
 Rules:
 - Describe what CHANGES between frames (not just what's visible in one frame).
-- Look for: someone pushing/hitting another person, objects being moved, \
-  fire spreading, someone falling, a chase sequence, break-in progression.
-- "action": describe the TEMPORAL action across frames (e.g., "pushing repeatedly", \
-  "setting fire then running", "falling to ground", "picking up and running away").
-- "is_suspicious": true if the sequence shows violence, theft progression, \
-  fire spreading, or any dangerous temporal pattern.
+- "action": describe the temporal action across frames.
+- "is_suspicious": true or false — based purely on what you observe.
 - "danger_score": based on the SEQUENCE, not any single frame.
 - Output ONLY JSON, no extra text.
 """
 
 GRID_USER_PROMPT = """\
-This 2×2 grid shows 4 consecutive frames from a surveillance camera \
-around T={timestamp:.2f}s. Oldest=top-left, Newest=bottom-right.
+This 2×2 grid shows 4 consecutive frames around T={timestamp:.2f}s. \
+Oldest=top-left, Newest=bottom-right.
 
-Analyze the TEMPORAL PROGRESSION. What is happening over these frames? \
-Output ONLY JSON:
+Describe what happens over these frames. Output ONLY JSON:
 
 {{
   "temporal_action": "<what action unfolds across the 4 frames?>",
-  "context_relation": "<how does this relate to the surroundings?>",
-  "action": "<precise atomic action verb for the latest frame>",
+  "context_relation": "<visible surroundings>",
+  "action": "<atomic action verb for the latest frame>",
   "action_object": "<object or none>",
   "posture": "<body posture in latest frame>",
   "scene_context": "<environment type>",

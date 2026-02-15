@@ -41,7 +41,7 @@ def process_model_output(model_output_path, annotations):
     
     # 第一阶段：收集所有视频的时间片段
     with open(model_output_path, 'r') as f:
-        for line in f:s
+        for line in f:
             parts = line.strip().split()
             path = parts[0]
             s = int(parts[1])
@@ -86,7 +86,8 @@ def process_model_output(model_output_path, annotations):
 # === 修改 main 函数定义 ===
 def main(model_output_path, auc_output_path):  # 添加参数
     # === 删除内部 argparse 代码 ===
-    annotation_path = "/tag.txt"
+    # XD-Violence 标注文件
+    annotation_path = "/data/liuzhe/EventVAD/src/event_seg/videos/annotations.txt"
     
     target_videos = get_target_videos(model_output_path)
     annotations = load_relevant_annotations(annotation_path, target_videos)

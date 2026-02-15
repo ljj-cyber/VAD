@@ -1,37 +1,48 @@
 import os
 import cv2
-import glob
 from config import Config
-from utils import video_to_frames
+from video_utils import video_to_frames
 from uniseg_processor import UniSegProcessor
 
-def process_video(input_path, output_dir):
-    processor = UniSegProcessor()
 
-    # 获取视频基本信息
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(input_path, cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            raise ValueError(f"无法打开视频文件：{input_path}")
-    
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    
-    # 计算新尺寸
-    ratio = min(Config.max_resolution[0]/original_width, 
-               Config.max_resolution[1]/original_height)
-    new_size = (int(original_width*ratio), int(original_height*ratio)) if ratio < 1 else (original_width, original_height)
-    new_size = (new_size[0]//2*2, new_size[1]//2*2)  # 确保尺寸为偶数
-    
+def process_video_with_processor(processor, input_path, output_dir):
+    """
+    使用已初始化的 processor 处理视频（复用模型，避免重复初始化）
+    """
     # 读取帧
     frames, fps, new_size = video_to_frames(input_path) 
+    total_frames = len(frames)
+    if total_frames == 0:
+        return []
     
     # 处理视频获取边界
     boundaries = processor.process(frames, fps)
+    
+    return _save_segments(frames, fps, new_size, boundaries, total_frames, output_dir)
+
+
+def process_video(input_path, output_dir):
+    """
+    处理单个视频（向后兼容，每次创建新的 processor）
+    """
+    processor = UniSegProcessor()
+    
+    # 读取帧
+    frames, fps, new_size = video_to_frames(input_path) 
+    total_frames = len(frames)
+    if total_frames == 0:
+        return []
+    
+    # 处理视频获取边界
+    boundaries = processor.process(frames, fps)
+    
+    return _save_segments(frames, fps, new_size, boundaries, total_frames, output_dir)
+
+
+def _save_segments(frames, fps, new_size, boundaries, total_frames, output_dir):
+    """
+    保存分段视频
+    """
 
     # 转换边界为帧索引
     frame_boundaries = []
@@ -80,7 +91,6 @@ def process_video(input_path, output_dir):
             print("无法找到新编码器，回退mp4v")
             selected_codec = 'mp4v'
         
-        cap = cv2.VideoCapture(input_path)
         for seg_idx, (start, end) in enumerate(frame_boundaries):
             output_path = os.path.join(output_dir, f"segment_{seg_idx:04d}.mp4")
             
@@ -95,25 +105,17 @@ def process_video(input_path, output_dir):
                 print(f"视频写入失败，改用PNG序列保存片段 {seg_idx}")
                 seg_dir = os.path.join(output_dir, f"segment_{seg_idx:04d}")
                 os.makedirs(seg_dir, exist_ok=True)
-                
-                cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-                for idx in range(start, end+1):
-                    ret, frame = cap.read()
-                    if ret:
-                        cv2.imwrite(os.path.join(seg_dir, f"frame_{idx:06d}.png"), frame)
+                for idx in range(start, end + 1):
+                    frame_bgr = frames[idx][:, :, ::-1]
+                    cv2.imwrite(
+                        os.path.join(seg_dir, f"frame_{idx:06d}.png"),
+                        frame_bgr
+                    )
                 continue
                 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-            current_frame = start
-            while current_frame <= end:
-                ret, frame = cap.read()
-                if ret:
-                    out.write(frame)
-                    current_frame += 1
-                else:
-                    break
+            for idx in range(start, end + 1):
+                frame_bgr = frames[idx][:, :, ::-1]
+                out.write(frame_bgr)
             out.release()
-        
-        cap.release()
     
     return frame_boundaries

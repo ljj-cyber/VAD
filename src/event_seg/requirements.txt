@@ -19,10 +19,10 @@ bleach==6.2.0
 blinker==1.9.0
 blis==1.2.0
 braceexpand==0.1.7
-Brotli @ file:///croot/brotli-split_1736182456865/work
+# Brotli @ file:///croot/brotli-split_1736182456865/work
 cachetools==5.5.2
 catalogue==2.0.10
-certifi @ file:///croot/certifi_1738623731865/work/certifi
+# certifi @ file:///croot/certifi_1738623731865/work/certifi
 cffi==1.17.1
 cfgv==3.4.0
 charset-normalizer==2.1.1
@@ -49,14 +49,14 @@ exceptiongroup==1.2.2
 executing==2.2.0
 fairscale==0.4.4
 fastjsonschema==2.21.1
-filelock @ file:///croot/filelock_1700591183607/work
+# filelock @ file:///croot/filelock_1700591183607/work
 fonttools==4.56.0
 fqdn==1.5.1
 fsspec==2024.6.1
 ftfy==6.3.1
 gitdb==4.0.12
 GitPython==3.1.44
-gmpy2 @ file:///croot/gmpy2_1738085463648/work
+# gmpy2 @ file:///croot/gmpy2_1738085463648/work
 greenlet==3.1.1
 h5py==3.13.0
 huggingface-hub==0.25.2
@@ -105,10 +105,10 @@ matplotlib-inline==0.1.7
 mdurl==0.1.2
 mistune==3.1.2
 mkl-service==2.4.0
-mkl_fft @ file:///io/mkl313/mkl_fft_1730824109137/work
-mkl_random @ file:///io/mkl313/mkl_random_1730823916628/work
+# mkl_fft @ file:///io/mkl313/mkl_fft_1730824109137/work
+# mkl_random @ file:///io/mkl313/mkl_random_1730823916628/work
 moviepy==1.0.3
-mpmath @ file:///croot/mpmath_1690848262763/work
+# mpmath @ file:///croot/mpmath_1690848262763/work
 murmurhash==1.0.12
 narwhals==1.27.1
 nbclassic==1.2.0
@@ -157,19 +157,19 @@ pydantic_core==2.27.2
 pydeck==0.9.1
 Pygments==2.19.1
 pyparsing==3.2.1
-PySocks @ file:///tmp/build/80754af9/pysocks_1605305812635/work
+# PySocks @ file:///tmp/build/80754af9/pysocks_1605305812635/work
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
 python-json-logger==3.2.1
 python-magic==0.4.27
 python-slugify==8.0.4
 pytz==2025.1
-PyYAML @ file:///croot/pyyaml_1728657952215/work
+# PyYAML @ file:///croot/pyyaml_1728657952215/work
 pyyaml_env_tag==0.1
 pyzmq==26.2.1
 referencing==0.36.2
 regex==2024.11.6
-requests @ file:///croot/requests_1730999120400/work
+# requests @ file:///croot/requests_1730999120400/work
 rfc3339-validator==0.1.4
 rfc3986-validator==0.1.1
 rich==13.9.4
@@ -218,7 +218,7 @@ transformers==4.33.2
 triton==2.1.0
 typer==0.15.1
 types-python-dateutil==2.9.0.20241206
-typing_extensions @ file:///croot/typing_extensions_1734714854207/work
+# typing_extensions @ file:///croot/typing_extensions_1734714854207/work
 tzdata==2025.1
 uri-template==1.3.0
 urllib3==1.26.13

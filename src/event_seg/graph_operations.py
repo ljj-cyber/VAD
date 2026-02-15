@@ -1,119 +1,145 @@
-import os
-import cv2
-import glob
+import numpy as np
+import torch
 from config import Config
-from utils import video_to_frames
-from uniseg_processor import UniSegProcessor
 
-def process_video(input_path, output_dir):
-    processor = UniSegProcessor()
 
-    # 获取视频基本信息
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(input_path, cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            raise ValueError(f"无法打开视频文件：{input_path}")
+def graph_propagation(G):
+    """
+    GPU 加速的图传播算法：使用 GAT 风格的注意力机制更新节点特征
+    """
+    nodes = sorted(G.nodes())
+    n = len(nodes)
     
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
+    if n == 0:
+        return G
     
-    # 计算新尺寸
-    ratio = min(Config.max_resolution[0]/original_width, 
-               Config.max_resolution[1]/original_height)
-    new_size = (int(original_width*ratio), int(original_height*ratio)) if ratio < 1 else (original_width, original_height)
-    new_size = (new_size[0]//2*2, new_size[1]//2*2)  # 确保尺寸为偶数
+    device = Config.device if torch.cuda.is_available() else 'cpu'
     
-    # 读取帧
-    frames, fps, new_size = video_to_frames(input_path) 
+    # 获取特征矩阵
+    features = np.array([G.nodes[i]['feature'] for i in nodes])
+    features_t = torch.from_numpy(features).float().to(device)
     
-    # 处理视频获取边界
-    boundaries = processor.process(frames, fps)
+    # 构建稀疏邻接矩阵的边列表
+    edge_list = []
+    edge_weights = []
+    for u, v, data in G.edges(data=True):
+        w = data.get('weight', 1.0)
+        edge_list.append([u, v])
+        edge_list.append([v, u])  # 无向图
+        edge_weights.append(w)
+        edge_weights.append(w)
+    
+    if len(edge_list) == 0:
+        return G
+    
+    # 转为 tensor
+    edge_index = torch.tensor(edge_list, dtype=torch.long, device=device).t()
+    edge_weight = torch.tensor(edge_weights, dtype=torch.float32, device=device)
+    
+    # 计算度归一化
+    row = edge_index[0]
+    deg = torch.zeros(n, device=device)
+    deg.scatter_add_(0, row, edge_weight)
+    deg_inv = 1.0 / (deg + 1e-6)
+    
+    # 归一化权重
+    norm_weight = edge_weight * deg_inv[row]
+    
+    # 迭代传播
+    for _ in range(Config.gat_iters):
+        # 稀疏矩阵乘法
+        col = edge_index[1]
+        
+        # 聚合邻居特征
+        new_features = torch.zeros_like(features_t)
 
-    # 转换边界为帧索引
-    frame_boundaries = []
-    if boundaries:
-        for start_sec, end_sec in boundaries:
-            start_frame = int(round(start_sec * fps))
-            end_frame = min(int(round(end_sec * fps)), total_frames - 1)
-            if end_frame - start_frame > 1:
-                frame_boundaries.append((start_frame, end_frame))
+        # 使用 scatter_add 进行高效聚合
+        weighted_features = features_t[col] * norm_weight.unsqueeze(1)
+        new_features.scatter_add_(0, row.unsqueeze(1).expand(-1, features_t.size(1)), weighted_features)
         
-        # 添加起始和结束边界
-        if frame_boundaries and frame_boundaries[0][0] > 0:
-            frame_boundaries.insert(0, (0, frame_boundaries[0][0]))
-        
-        last_end = frame_boundaries[-1][1] if frame_boundaries else 0
-        if last_end < total_frames - 1:
-            frame_boundaries.append((last_end, total_frames - 1))
-    else:
-        frame_boundaries.append((0, total_frames - 1))
-
-    # 保存分段视频
-    if frame_boundaries:
-        codec_candidates = [
-            ('mp4v', 'mp4v'),
-            ('avc1', 'avc1'),
-            ('xvid', 'XVID')
-        ]
-        
-        selected_codec = None
-        for codec_name, fourcc_code in codec_candidates:
-            test_path = os.path.join(output_dir, f"test_{codec_name}.mp4")
-            test_writer = cv2.VideoWriter(
-                test_path, 
-                cv2.VideoWriter_fourcc(*fourcc_code),
-                fps, 
-                new_size
-            )
-            if test_writer.isOpened():
-                test_writer.release()
-                os.remove(test_path)
-                selected_codec = fourcc_code
-                print(f"选择编码器: {fourcc_code}")
-                break
-        
-        if selected_codec is None:
-            print("无法找到新编码器，回退mp4v")
-            selected_codec = 'mp4v'
-        
-        cap = cv2.VideoCapture(input_path)
-        for seg_idx, (start, end) in enumerate(frame_boundaries):
-            output_path = os.path.join(output_dir, f"segment_{seg_idx:04d}.mp4")
-            
-            out = cv2.VideoWriter(
-                output_path,
-                cv2.VideoWriter_fourcc(*selected_codec),
-                fps,
-                new_size
-            )
-            
-            if not out.isOpened():
-                print(f"视频写入失败，改用PNG序列保存片段 {seg_idx}")
-                seg_dir = os.path.join(output_dir, f"segment_{seg_idx:04d}")
-                os.makedirs(seg_dir, exist_ok=True)
-                
-                cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-                for idx in range(start, end+1):
-                    ret, frame = cap.read()
-                    if ret:
-                        cv2.imwrite(os.path.join(seg_dir, f"frame_{idx:06d}.png"), frame)
-                continue
-                
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-            current_frame = start
-            while current_frame <= end:
-                ret, frame = cap.read()
-                if ret:
-                    out.write(frame)
-                    current_frame += 1
-                else:
-                    break
-            out.release()
-        
-        cap.release()
+        # 残差连接
+        features_t = 0.5 * features_t + 0.5 * new_features
     
-    return frame_boundaries
+    # 转回 numpy
+    features = features_t.cpu().numpy()
+    
+    # 更新图中的特征
+    for i, node in enumerate(nodes):
+        G.nodes[node]['feature'] = features[i]
+    
+    del features_t
+    torch.cuda.empty_cache()
+    
+    return G
+
+
+def graph_propagation_sparse(G):
+    """
+    使用 PyTorch Sparse 的更高效版本（适合超大图）
+    """
+    try:
+        import torch_sparse
+        # 如果安装了 torch_sparse，可以用更高效的实现
+        return _graph_propagation_torch_sparse(G)
+    except ImportError:
+        return graph_propagation(G)
+
+
+def _graph_propagation_torch_sparse(G):
+    """
+    使用 torch_sparse 的实现
+    """
+    import torch_sparse
+    
+    nodes = sorted(G.nodes())
+    n = len(nodes)
+    
+    if n == 0:
+        return G
+    
+    device = Config.device if torch.cuda.is_available() else 'cpu'
+    
+    features = np.array([G.nodes[i]['feature'] for i in nodes])
+    features_t = torch.from_numpy(features).float().to(device)
+    
+    edge_list = []
+    edge_weights = []
+    for u, v, data in G.edges(data=True):
+        w = data.get('weight', 1.0)
+        edge_list.append([u, v])
+        edge_list.append([v, u])
+        edge_weights.append(w)
+        edge_weights.append(w)
+    
+    if len(edge_list) == 0:
+        return G
+    
+    edge_index = torch.tensor(edge_list, dtype=torch.long, device=device).t()
+    edge_weight = torch.tensor(edge_weights, dtype=torch.float32, device=device)
+    
+    # 使用 torch_sparse 进行高效稀疏矩阵运算
+    for _ in range(Config.gat_iters):
+        # 稀疏矩阵乘法
+        new_features = torch_sparse.spmm(
+            edge_index, edge_weight, n, n, features_t
+        )
+        
+        # 度归一化
+        deg = torch_sparse.spmm(
+            edge_index, edge_weight, n, n, 
+            torch.ones(n, 1, device=device)
+        ).squeeze()
+        new_features = new_features / (deg.unsqueeze(1) + 1e-6)
+        
+        # 残差连接
+        features_t = 0.5 * features_t + 0.5 * new_features
+    
+    features = features_t.cpu().numpy()
+    
+    for i, node in enumerate(nodes):
+        G.nodes[node]['feature'] = features[i]
+    
+    del features_t
+    torch.cuda.empty_cache()
+    
+    return G
