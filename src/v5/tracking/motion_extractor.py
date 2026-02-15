@@ -45,11 +45,13 @@ class MotionExtractor:
         self.cfg = cfg or MotionConfig()
         self._prev_gray: Optional[np.ndarray] = None
         self._frame_idx: int = 0
+        self._last_global_energy: float = 0.0  # extract() 计算的全帧动能
 
     def reset(self):
         """重置状态（处理新视频时调用）"""
         self._prev_gray = None
         self._frame_idx = 0
+        self._last_global_energy = 0.0
 
     def extract(self, frame: np.ndarray) -> list[MotionRegion]:
         """
@@ -76,8 +78,9 @@ class MotionExtractor:
         diff = cv2.absdiff(gray, self._prev_gray)
         self._prev_gray = gray
 
-        # 全帧动能 (归一化)
+        # 全帧动能 (归一化) — 同时缓存供 compute_frame_energy() 使用
         global_energy = float(diff.mean()) / 255.0
+        self._last_global_energy = global_energy
 
         # 阈值化
         _, thresh = cv2.threshold(diff, self.cfg.diff_threshold, 255, cv2.THRESH_BINARY)
@@ -140,13 +143,11 @@ class MotionExtractor:
 
         return regions
 
-    def compute_frame_energy(self, frame: np.ndarray) -> float:
-        """计算当前帧与上一帧的全局动能 (0-1)，不修改内部状态"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if self.cfg.blur_kernel_size > 0:
-            k = self.cfg.blur_kernel_size
-            gray = cv2.GaussianBlur(gray, (k, k), 0)
-        if self._prev_gray is None:
-            return 0.0
-        diff = cv2.absdiff(gray, self._prev_gray)
-        return float(diff.mean()) / 255.0
+    def compute_frame_energy(self, frame: np.ndarray = None) -> float:
+        """
+        返回上一次 extract() 计算的全帧动能 (0-1)。
+
+        注意：必须在 extract() 之后调用，返回的是 extract() 时已计算好的值。
+        不再重复计算（避免 _prev_gray 已更新导致 diff=0 的 bug）。
+        """
+        return self._last_global_energy
