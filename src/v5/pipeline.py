@@ -2,7 +2,7 @@
 V5 Tube-Skeleton Pipeline — 视频异常检测主流程
 
 三阶段架构:
-  Stage 1: 物理追踪骨架 — MotionExtractor + CLIP Crop + EntityTracker
+  Stage 1: 物理追踪骨架 — HybridDetector(帧差+YOLO) + CLIP Crop + EntityTracker
   Stage 2: 稀疏语义挂载 — NodeTrigger + SemanticVLLM (仅关键帧调用)
   Stage 3: 动态图审计   — GraphBuilder + NarrativeGenerator + DecisionAuditor
 
@@ -11,6 +11,7 @@ V5 Tube-Skeleton Pipeline — 视频异常检测主流程
 """
 
 import json
+import re
 import time
 import logging
 from pathlib import Path
@@ -21,6 +22,7 @@ import numpy as np
 
 from .config import (
     MotionConfig, CLIPEncoderConfig, TrackerConfig,
+    YoloDetectorConfig, HybridDetectorConfig,
     NodeTriggerConfig, SemanticVLLMConfig,
     GraphConfig, NarrativeConfig, DecisionConfig,
     OUTPUT_DIR,
@@ -31,6 +33,7 @@ from .tracking.clip_encoder import CropCLIPEncoder
 from .tracking.entity_tracker import EntityTracker
 from .tracking.visual_painter import VisualPainter
 from .tracking.multi_frame_stacker import MultiFrameStacker
+from .tracking.hybrid_detector import HybridDetector
 
 from .semantic.node_trigger import NodeTrigger
 from .semantic.vllm_semantic import SemanticVLLM
@@ -52,18 +55,57 @@ class TubeSkeletonPipeline:
     输出: VideoVerdict (异常判定 + 异常区间 + 叙事解释)
     """
 
+    # Regex: matches filenames like "Salt.2010__#..." or "Deadpool.2.2018__#..."
+    _MOVIE_FILENAME_RE = re.compile(
+        r'^(?!v=)[A-Z][\w.]+\.\d{4}__#', re.IGNORECASE
+    )
+
+    # Scene-context keywords that suggest cinematic/broadcast content
+    _CINEMATIC_SCENE_KEYWORDS = frozenset({
+        "movie", "film", "cinema", "studio", "stage", "set",
+        "broadcast", "tv show", "television", "news studio",
+        "sports arena", "basketball court", "soccer field",
+        "football field", "stadium", "ice rink", "wrestling ring",
+        "boxing ring", "concert", "performance", "theater",
+    })
+
     def __init__(
         self,
         api_base: str = "http://localhost:8000",
         max_workers: int = 16,
         backend: str = "server",
+        disable_discordance: bool = False,
+        use_yolo: bool = False,
+        cinematic_filter: bool = False,
     ):
-        # Stage 1
-        self.motion_extractor = MotionExtractor(MotionConfig())
+        self.disable_discordance = disable_discordance
+        self.use_yolo = use_yolo
+        self.cinematic_filter = cinematic_filter
+
+        # Stage 1 — 始终使用 HybridDetector (帧差 + YOLO 融合)
+        #   use_yolo=False → lazy_yolo=True  (帧差优先, YOLO 按需 fallback)
+        #   use_yolo=True  → lazy_yolo=False (帧差 + YOLO 全程并行)
+        hybrid_cfg = HybridDetectorConfig()
+        hybrid_cfg.lazy_yolo = not use_yolo
+        if use_yolo:
+            logger.info("Using HybridDetector (MotionExtractor + YOLO-World, always-on)")
+        else:
+            logger.info(
+                f"Using HybridDetector (MotionExtractor + YOLO-World lazy fallback, "
+                f"streak_threshold={hybrid_cfg.empty_streak_for_yolo_fallback})"
+            )
+        self.hybrid_detector = HybridDetector(
+            motion_cfg=MotionConfig(),
+            yolo_cfg=YoloDetectorConfig(),
+            hybrid_cfg=hybrid_cfg,
+        )
+        self.motion_extractor = self.hybrid_detector.motion_extractor
+
         self.clip_encoder = CropCLIPEncoder(CLIPEncoderConfig())
         self.entity_tracker = EntityTracker(TrackerConfig())
         self.visual_painter = VisualPainter(output_size=(768, 768))
-        self.frame_stacker = MultiFrameStacker(buffer_interval_frames=6, grid_size=(768, 768))
+        # ★ 增大 stacker 间隔以减少内存占用 (6→10)
+        self.frame_stacker = MultiFrameStacker(buffer_interval_frames=10, grid_size=(768, 768))
 
         # Stage 2
         self.node_trigger = NodeTrigger(NodeTriggerConfig())
@@ -72,13 +114,18 @@ class TubeSkeletonPipeline:
         vllm_cfg.api_base = api_base
         vllm_cfg.max_workers = max_workers
         self.semantic_vllm = SemanticVLLM(vllm_cfg)
-        self.discordance_checker = DiscordanceChecker(
-            sigma_multiplier=5.0,
-            min_energy_threshold=0.15,
-            min_excess_ratio=2.5,
-            voting_suppress_ratio=0.5,
-        )
-        self.global_heartbeat = GlobalHeartbeat(heartbeat_sec=2.5, drift_threshold=0.18)
+        if not disable_discordance:
+            self.discordance_checker = DiscordanceChecker(
+                sigma_multiplier=5.0,
+                min_energy_threshold=0.20,
+                min_excess_ratio=3.5,
+                voting_suppress_ratio=0.35,
+            )
+        else:
+            self.discordance_checker = None
+            logger.info("Discordance checker DISABLED (ablation mode)")
+        # ★ 增大全局心跳间隔以减少 CLIP 编码频率 (2.5→4.0)
+        self.global_heartbeat = GlobalHeartbeat(heartbeat_sec=4.0, drift_threshold=0.18)
 
         # Stage 3
         self.graph_builder = GraphBuilder(GraphConfig())
@@ -90,7 +137,7 @@ class TubeSkeletonPipeline:
 
     def reset(self):
         """重置所有模块状态"""
-        self.motion_extractor.reset()
+        self.hybrid_detector.reset()
         self.entity_tracker.reset()
         self.node_trigger.reset()
         self.graph_builder.reset()
@@ -164,16 +211,19 @@ class TubeSkeletonPipeline:
 
             timestamp = frame_idx / max(fps, 1e-6)
 
-            # ── Stage 1: 动能 + 连通域 ──
-            regions = self.motion_extractor.extract(frame)
+            # ── Stage 1: 实体检测 (帧差 + YOLO 融合, YOLO 按需激活) ──
+            regions = self.hybrid_detector.detect(frame)
+            frame_energy = self.hybrid_detector.compute_frame_energy()
 
             # 收集帧级全局动能（用于背景校准）
-            frame_energy = self.motion_extractor.compute_frame_energy(frame)
             all_frame_energies.append(frame_energy)
 
             # 在前 calibration_n 帧收集完毕后，校准 DiscordanceChecker
-            if processed == calibration_n:
+            if processed == calibration_n and self.discordance_checker is not None:
                 self.discordance_checker.calibrate(all_frame_energies[:calibration_n])
+
+            # 记录本帧触发的实体 ID（用于心跳去重）
+            triggered_eids_this_frame: set[int] = set()
 
             if regions:
                 # CLIP encode crops (用于 EntityTracker 匹配)
@@ -205,6 +255,7 @@ class TubeSkeletonPipeline:
                     painted = self.visual_painter.paint(frame, regions, entity_ids)
                     for tr in triggers:
                         painted_images[tr.frame_idx] = painted
+                        triggered_eids_this_frame.add(tr.entity_id)
 
                     # 4 宫格拼图（多帧时序）
                     if self.frame_stacker.can_make_grid():
@@ -214,6 +265,30 @@ class TubeSkeletonPipeline:
                                 grid_images[tr.frame_idx] = grid
 
                 all_triggers.extend(triggers)
+
+            # ── Stage 2: 实体级心跳扫描（不依赖当前帧是否有 regions）──
+            # 对当前帧未触发的活跃实体做心跳检查，确保动态图能产生 Edge
+            active_eids = self.entity_tracker.get_active_entity_ids()
+            if active_eids:
+                hb_triggers = self.node_trigger.check_heartbeat_for_active(
+                    active_entity_ids=active_eids,
+                    current_timestamp=timestamp,
+                    current_frame_idx=frame_idx,
+                    entity_trace_buffer=entity_trace_buffer,
+                    triggered_eids=triggered_eids_this_frame,
+                )
+                if hb_triggers:
+                    for tr in hb_triggers:
+                        # 用当前帧全图作为 painted image
+                        if tr.frame_idx not in painted_images:
+                            painted_images[tr.frame_idx] = \
+                                self.visual_painter.paint_fullframe_only(frame)
+                        # 尝试生成 grid
+                        if tr.frame_idx not in grid_images and self.frame_stacker.can_make_grid():
+                            grid = self.frame_stacker.make_grid(current_frame=frame)
+                            if grid is not None:
+                                grid_images[tr.frame_idx] = grid
+                    all_triggers.extend(hb_triggers)
 
             # 每帧都推入 stacker（不论有无 region）
             self.frame_stacker.push(frame_idx, frame)
@@ -246,11 +321,18 @@ class TubeSkeletonPipeline:
         cap.release()
 
         t_tracking = time.time()
+        yolo_stats = self.hybrid_detector.yolo_stats
+        yolo_info = ""
+        if yolo_stats["total_yolo_frames"] > 0:
+            yolo_info = (
+                f", YOLO fallbacks={yolo_stats['fallback_count']}, "
+                f"YOLO frames={yolo_stats['total_yolo_frames']}"
+            )
         logger.info(
             f"Stage 1+2 Tracking: {processed} frames processed, "
             f"{len(self.entity_tracker.get_all_entity_ids())} entities, "
             f"{len(all_triggers)} triggers, "
-            f"{len(heartbeat_frames)} heartbeats | "
+            f"{len(heartbeat_frames)} heartbeats{yolo_info} | "
             f"{t_tracking - t_start:.1f}s"
         )
 
@@ -268,18 +350,24 @@ class TubeSkeletonPipeline:
         )
 
         # ── Stage 2: 矛盾检测 ──
-        entity_trace_energies: dict[int, list[float]] = {}
-        entity_trace_time_energy: dict[int, list[tuple[float, float]]] = {}
-        for eid, entries in entity_trace_buffer.items():
-            entity_trace_energies[eid] = [e.kinetic_energy for e in entries]
-            entity_trace_time_energy[eid] = [
-                (e.timestamp, e.kinetic_energy) for e in entries
-            ]
+        discordance_alerts = []
+        if self.discordance_checker is not None:
+            entity_trace_energies: dict[int, list[float]] = {}
+            entity_trace_time_energy: dict[int, list[tuple[float, float]]] = {}
+            for eid, entries in entity_trace_buffer.items():
+                entity_trace_energies[eid] = [e.kinetic_energy for e in entries]
+                entity_trace_time_energy[eid] = [
+                    (e.timestamp, e.kinetic_energy) for e in entries
+                ]
 
-        discordance_alerts = self.discordance_checker.check_video(
-            semantic_results, entity_trace_energies,
-            entity_trace_time_energy=entity_trace_time_energy,
-        )
+            discordance_alerts = self.discordance_checker.check_video(
+                semantic_results, entity_trace_energies,
+                entity_trace_time_energy=entity_trace_time_energy,
+            )
+            if discordance_alerts:
+                logger.info(f"Discordance alerts: {len(discordance_alerts)}")
+        else:
+            logger.info("Discordance checker disabled — skipping contradiction detection")
 
         # CLIP 漂移信息
         drift_info = {
@@ -287,13 +375,14 @@ class TubeSkeletonPipeline:
             "heartbeats": len(heartbeat_frames),
         }
 
-        if discordance_alerts:
-            logger.info(f"Discordance alerts: {len(discordance_alerts)}")
         if drift_info["max_drift"] > 0.15:
             logger.info(f"Scene drift detected: max={drift_info['max_drift']:.3f}")
 
         # ── Stage 3: 构建图 ──
         for sr in semantic_results:
+            if sr is None:
+                logger.warning("Skipping None semantic result in graph building")
+                continue
             eid = sr["entity_id"]
             trace_buf = entity_trace_buffer.get(eid, [])
             self.graph_builder.add_semantic_node(sr, trace_buf)
@@ -304,10 +393,31 @@ class TubeSkeletonPipeline:
         # 确定场景类型 (取最常见的 scene_context)
         scene_type = self._detect_scene(graphs)
 
+        # ── 电影场景检测 (cinematic filter) ──
+        is_cinematic = False
+        cinematic_reason = ""
+        if self.cinematic_filter:
+            fn_hit = self._detect_cinematic_by_filename(video_path)
+            sem_hit, sem_ratio = self._detect_cinematic_by_semantics(semantic_results)
+            if fn_hit:
+                is_cinematic = True
+                cinematic_reason = f"filename_match (ratio={sem_ratio:.2f})"
+            elif sem_hit:
+                is_cinematic = True
+                cinematic_reason = f"semantic_scene (ratio={sem_ratio:.2f})"
+
+            if is_cinematic:
+                logger.info(
+                    f"Cinematic scene detected: {cinematic_reason} → "
+                    f"suppressing anomaly verdicts"
+                )
+
         verdict = self.decision_auditor.audit_video(
             graphs, scene_type,
             discordance_alerts=discordance_alerts,
             drift_info=drift_info,
+            entity_trace_buffer=entity_trace_buffer,
+            is_cinematic=is_cinematic,
         )
 
         t_end = time.time()
@@ -321,34 +431,6 @@ class TubeSkeletonPipeline:
             f"({verdict.confidence:.2f})"
         )
 
-        # ── 构建 danger_timeline: 所有语义节点的 (timestamp, danger_score) ──
-        danger_timeline = []
-        for sr in semantic_results:
-            danger_timeline.append({
-                "timestamp": round(sr.get("timestamp", 0.0), 3),
-                "danger_score": round(sr.get("danger_score", 0.0), 4),
-                "is_suspicious": sr.get("is_suspicious", False),
-                "entity_id": sr.get("entity_id", -1),
-                "action": sr.get("action", "unknown"),
-            })
-        danger_timeline.sort(key=lambda x: x["timestamp"])
-
-        # ── 构建帧级动能时间线 (下采样到每秒) ──
-        energy_per_sec = []
-        if all_frame_energies:
-            sec_bins = int(video_duration) + 1
-            for s in range(sec_bins):
-                frame_start = int(s * fps / sample_every_n)
-                frame_end = int((s + 1) * fps / sample_every_n)
-                bin_energies = all_frame_energies[frame_start:frame_end]
-                if bin_energies:
-                    energy_per_sec.append(round(max(bin_energies), 4))
-                else:
-                    energy_per_sec.append(0.0)
-
-        # ── 心跳漂移时间线 ──
-        drift_timeline = self.global_heartbeat.get_drift_timeline()
-
         # ── 构建输出 ──
         result = {
             "video_path": str(video_path),
@@ -361,6 +443,8 @@ class TubeSkeletonPipeline:
                 "confidence": round(verdict.confidence, 3),
                 "anomaly_entity_ids": verdict.anomaly_entity_ids,
                 "scene_type": scene_type,
+                "is_cinematic": is_cinematic if self.cinematic_filter else None,
+                "cinematic_reason": cinematic_reason if self.cinematic_filter else None,
                 "summary": verdict.summary,
                 "entity_verdicts": [
                     {
@@ -374,15 +458,6 @@ class TubeSkeletonPipeline:
                     }
                     for v in verdict.entity_verdicts
                 ],
-            },
-            "temporal_signals": {
-                "danger_timeline": danger_timeline,
-                "energy_per_sec": energy_per_sec,
-                "drift_timeline": [
-                    {"timestamp": round(t, 3), "drift": round(d, 4)}
-                    for t, d in drift_timeline
-                ],
-                "heartbeat_frames": heartbeat_frames,
             },
             "timing": {
                 "tracking_sec": round(t_tracking - t_start, 2),
@@ -416,6 +491,44 @@ class TubeSkeletonPipeline:
             return scenes.most_common(1)[0][0]
         return "unknown"
 
+    @classmethod
+    def _detect_cinematic_by_filename(cls, video_path: str) -> bool:
+        """Detect movie/film clips via filename pattern (e.g. 'Salt.2010__#...')."""
+        stem = Path(video_path).stem
+        return bool(cls._MOVIE_FILENAME_RE.match(stem))
+
+    @classmethod
+    def _detect_cinematic_by_semantics(
+        cls, semantic_results: list[dict], threshold: float = 0.3,
+    ) -> tuple[bool, float]:
+        """
+        Detect cinematic/broadcast content from VLLM scene_context fields.
+
+        Returns (is_cinematic, cinematic_ratio).
+        """
+        if not semantic_results:
+            return False, 0.0
+
+        total = 0
+        cinematic_hits = 0
+        for sr in semantic_results:
+            if sr is None:
+                continue
+            ctx = str(sr.get("scene_context", "")).lower().strip()
+            if not ctx or ctx == "unknown":
+                continue
+            total += 1
+            for kw in cls._CINEMATIC_SCENE_KEYWORDS:
+                if kw in ctx:
+                    cinematic_hits += 1
+                    break
+
+        if total == 0:
+            return False, 0.0
+
+        ratio = cinematic_hits / total
+        return ratio >= threshold, ratio
+
 
 # ── CLI 入口 ──────────────────────────────────────────
 def main():
@@ -425,10 +538,16 @@ def main():
     parser.add_argument("--video", required=True, help="Video file path")
     parser.add_argument("--api-base", default="http://localhost:8000", help="vLLM API base URL")
     parser.add_argument("--backend", default="server", choices=["server", "local"])
-    parser.add_argument("--max-workers", type=int, default=16)
+    parser.add_argument("--max-workers", type=int, default=48)
     parser.add_argument("--sample-every", type=int, default=2, help="Process every N-th frame")
     parser.add_argument("--max-frames", type=int, default=0, help="Max frames to process (0=all)")
     parser.add_argument("--output", default="", help="Output JSON path")
+    parser.add_argument("--no-discordance", action="store_true",
+                        help="Disable discordance checker (ablation: pure semantic)")
+    parser.add_argument("--yolo", action="store_true",
+                        help="Enable YOLO-World hybrid detection (motion + semantic)")
+    parser.add_argument("--cinematic-filter", action="store_true",
+                        help="Enable cinematic/movie scene filter")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -441,6 +560,9 @@ def main():
         api_base=args.api_base,
         max_workers=args.max_workers,
         backend=args.backend,
+        disable_discordance=args.no_discordance,
+        use_yolo=args.yolo,
+        cinematic_filter=args.cinematic_filter,
     )
 
     result = pipeline.analyze_video(

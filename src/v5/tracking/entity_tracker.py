@@ -157,13 +157,23 @@ class EntityTracker:
                 matched_active.add(ai)
                 matched_region.add(ri)
 
-        # 未匹配的 region → 分配新 ID (如果动能足够大)
+        # 未匹配的 region → 分配新 ID
+        # YOLO 检出的异常相关类别（person 等）跳过动能门限；
+        # 静态背景（truck/car 等）仍需动能校验，避免噪声实体干扰追踪。
+        _YOLO_EXEMPT_CLASSES = {
+            "person", "fire", "smoke", "knife", "gun",
+            "explosion", "blood", "bat", "hammer", "crowbar",
+        }
         for ri in range(n_regions):
             if ri in matched_region:
                 continue
 
             region = regions[ri]
-            if region.kinetic_energy < self.cfg.min_kinetic_for_new:
+            yolo_exempt = (
+                getattr(region, "source", "") in ("yolo", "fused")
+                and getattr(region, "class_name", "") in _YOLO_EXEMPT_CLASSES
+            )
+            if not yolo_exempt and region.kinetic_energy < self.cfg.min_kinetic_for_new:
                 continue
 
             if len(self._active) >= self.cfg.max_active_entities:

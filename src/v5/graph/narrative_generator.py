@@ -15,6 +15,8 @@ Stage 3-C: NarrativeGenerator — 叙事生成器
 import logging
 from typing import Optional, Any
 
+import numpy as np
+
 from ..config import NarrativeConfig
 from .structures import EntityGraph, TemporalNode, EvolutionEdge
 
@@ -44,14 +46,16 @@ class NarrativeGenerator:
         graph: EntityGraph,
         discordance_alerts: Optional[list] = None,
         drift_info: Optional[dict] = None,
+        trace_entries: Optional[list] = None,
     ) -> str:
         """
-        生成单个实体的叙事文本，含物理异常预警。
+        生成单个实体的叙事文本，含物理异常预警和物理轨迹摘要。
 
         Args:
             graph: EntityGraph (已包含 nodes + edges)
             discordance_alerts: DiscordanceAlert 列表（物理-语义矛盾）
             drift_info: {"max_drift": float, "drift_timestamps": [...]}
+            trace_entries: 该实体的完整 TraceEntry 列表（零VLLM开销的物理数据）
 
         Returns:
             叙事文本字符串
@@ -99,6 +103,44 @@ class NarrativeGenerator:
             )
             parts.append("")
 
+        # ── 物理轨迹摘要 (来自 trace_log，零 VLLM 开销) ──
+        if trace_entries and len(trace_entries) > 1:
+            energies = [e.kinetic_energy for e in trace_entries]
+            track_duration = trace_entries[-1].timestamp - trace_entries[0].timestamp
+
+            # bbox 位移
+            try:
+                bx0, by0 = float(trace_entries[0].bbox[0]), float(trace_entries[0].bbox[1])
+                bx1, by1 = float(trace_entries[-1].bbox[0]), float(trace_entries[-1].bbox[1])
+                displacement = ((bx1 - bx0) ** 2 + (by1 - by0) ** 2) ** 0.5
+            except (TypeError, ValueError, IndexError):
+                displacement = 0.0
+
+            parts.append("[Physical Trajectory]")
+            parts.append(
+                f"  Tracked {len(trace_entries)} frames over {track_duration:.1f}s"
+            )
+            parts.append(
+                f"  Kinetic energy: mean={np.mean(energies):.4f}, "
+                f"max={np.max(energies):.4f}, "
+                f"integral={sum(energies):.4f}"
+            )
+            if displacement > 20:
+                parts.append(f"  Bbox displacement: {displacement:.0f}px")
+
+            # 动能趋势 (上升/下降/平稳)
+            if len(energies) >= 4:
+                first_half = float(np.mean(energies[: len(energies) // 2]))
+                second_half = float(np.mean(energies[len(energies) // 2 :]))
+                ratio = second_half / max(first_half, 1e-6)
+                if ratio > 1.3:
+                    parts.append("  Trend: kinetic energy RISING")
+                elif ratio < 0.7:
+                    parts.append("  Trend: kinetic energy FALLING")
+                else:
+                    parts.append("  Trend: kinetic energy STABLE")
+            parts.append("")
+
         # 逐节点 + 逐边描述
         for i, node in enumerate(nodes):
             # Node 描述
@@ -132,6 +174,17 @@ class NarrativeGenerator:
                     edge_line += f" | missing_frames={edge.missing_frames}"
 
                 parts.append(edge_line)
+
+        # Anomaly category hints (从 VLLM anomaly_category_guess 统计)
+        from collections import Counter
+        cat_counts = Counter(
+            n.anomaly_category_guess for n in nodes
+            if hasattr(n, 'anomaly_category_guess')
+            and n.anomaly_category_guess not in ("none", "unknown", "")
+        )
+        if cat_counts:
+            parts.append("")
+            parts.append(f"Anomaly hints: {dict(cat_counts)}")
 
         # 全局统计
         parts.append("")

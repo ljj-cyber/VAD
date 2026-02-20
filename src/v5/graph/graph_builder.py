@@ -81,6 +81,7 @@ class GraphBuilder:
             scene_context=semantic_result.get("scene_context", "unknown"),
             is_suspicious=semantic_result.get("is_suspicious", False),
             danger_score=semantic_result.get("danger_score", 0.0),
+            anomaly_category_guess=semantic_result.get("anomaly_category_guess", "none"),
             trigger_rule=semantic_result.get("trigger_rule", ""),
             kinetic_energy=self._get_kinetic_from_trace(trace_entries, frame_idx),
         )

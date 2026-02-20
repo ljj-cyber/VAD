@@ -59,29 +59,94 @@ class VideoVerdict:
 DECISION_SYSTEM_PROMPT = """\
 You are a decision module for a surveillance video anomaly detection system.
 
-Your task: Given an entity's behavior trajectory narrative, determine if the \
-behavior is anomalous.
+Your task: Given an entity's behavior trajectory narrative, determine whether \
+the behavior constitutes a REAL-WORLD ANOMALY that would require security attention.
 
-Analyze the action sequence and temporal pattern. \
-Decide whether the observed behavior constitutes an anomaly based on the provided narrative.
+## What counts as ANOMALOUS (flag is_anomaly=true):
 
-If the behavior IS anomalous, you MUST provide the precise time interval \
-(anomaly_start_sec, anomaly_end_sec) that covers the full anomalous segment. \
-Use the timestamps (T=...) from the narrative to determine the interval boundaries.
+### Overt anomalies (clearly visible):
+- Violence: fighting, assault, pushing, kicking, restraining someone
+- Fire / arson: burning, smoke, explosion, fire spreading
+- Accidents: vehicle collision, person falling and not getting up, hit-and-run
+- Weapons: brandishing a gun, knife, or weapon
+- Trespassing / intrusion: climbing fences, forced entry
+
+### Covert anomalies (subtle but equally important):
+- Shoplifting: picking up items then concealing them; browsing unusually long near \
+merchandise then leaving without checkout; handling items while repeatedly looking around
+- Stealing: accessing or tampering with property that doesn't belong to the person \
+(e.g. reaching into a car, opening someone else's bag); taking items from an \
+unattended location; removing objects without a visible transaction
+- Abuse: one person physically dominating another — pushing, shoving, slapping, \
+cornering, forcing someone to the ground; one person cowering/crouching while \
+another looms over or strikes them; aggressive close-proximity interactions
+- Vandalism: kicking, hitting, or throwing objects at property; spray-painting \
+walls or surfaces; smashing windows, signs, or fixtures; deliberately damaging \
+vehicles or public infrastructure
+
+## What is NORMAL (flag is_anomaly=false):
+- Everyday activities: walking, standing, sitting, reading, working, talking
+- Normal transitions: standing→sitting, walking→stopping, driving→parking
+- Posture changes: bending, stretching, leaning, crouching briefly to pick something up
+- Routine work: typing, operating machines, stocking shelves, cleaning
+- Normal movement patterns: entering/exiting, browsing in a store, waiting in line
+- Retail/store-specific normal behaviors: picking up items to examine then \
+replacing them, walking between aisles while carrying items, standing near or \
+at checkout counters, using self-checkout terminals, interacting with cashiers, \
+paying for goods. Store employees approaching customers, operating POS terminals, \
+restocking shelves, and handling merchandise are all NORMAL work activities — \
+do NOT flag these as shoplifting.
+- Idle or stationary behavior, even for prolonged periods
+- Kinetic energy fluctuations alone do NOT indicate anomaly unless paired with \
+clearly dangerous actions
+
+## CRITICAL — High Kinetic Energy ≠ Anomaly:
+- Many NORMAL activities produce high kinetic energy: sports (basketball, soccer, \
+martial arts), dancing, running/jogging, military parades, action movie scenes, \
+fast-paced driving, crowd celebrations, concerts, and physical exercise.
+- Movie/film clips often contain dramatic scenes (chase sequences, stunts, \
+choreographed fights, explosions) that are FICTIONAL — these are NOT real anomalies.
+- Do NOT flag high kinetic energy as anomalous unless the narrative explicitly \
+describes REAL violence, property damage, or criminal behavior with clear victims.
+- "Perception blind spot" or "kinetic energy exceeding threshold" alone is \
+NEVER sufficient evidence for anomaly — you MUST see specific dangerous actions \
+described in the narrative text.
+
+## Key principles:
+- Flag behavior as anomalous ONLY if the ACTIONS described in the narrative \
+clearly match a specific overt OR covert anomaly category above.
+- Do NOT flag behavior merely because it involves transitions, posture changes, \
+or kinetic energy variations.
+- High kinetic energy, "perception blind spot", or "energy exceeding threshold" \
+are NOT anomaly evidence by themselves. You MUST identify SPECIFIC dangerous \
+actions (hitting, shooting, stealing, burning, etc.) in the narrative.
+- Pay special attention to person-object and person-person interactions described \
+in the narrative — these are critical for detecting covert anomalies.
+- When the narrative describes someone handling objects near others' property, \
+or aggressive physical contact between people, treat these as strong anomaly signals.
+- In retail settings, most people are legitimate customers or employees. \
+Shoplifting requires CLEAR evidence of concealment or deliberately avoiding \
+checkout — merely picking up items, walking through aisles, or interacting \
+near checkout counters is NORMAL shopping behavior.
+- When is_cinematic_false_alarm applies: if the scene appears to be from a \
+movie, TV show, sports broadcast, or staged performance, set \
+is_cinematic_false_alarm=true even if the depicted actions look violent.
 
 Output ONLY valid JSON. No extra text.
 """
 
 DECISION_USER_TEMPLATE = """\
 ## Scenario: {scene_type}
-
+{contracts_section}
 ## Entity Behavior Narrative:
 {narrative}
 
 ---
 
-Based on the above narrative, determine whether this entity's behavior is anomalous.
-
+Determine whether this entity's behavior is anomalous (matches violence, theft, \
+fire, accident, weapons, vandalism, or intrusion). Normal daily activities and \
+routine transitions should NOT be flagged.
+{contracts_reminder}
 Output ONLY JSON:
 
 {{
@@ -99,7 +164,8 @@ observed in the narrative (use the T=... timestamps as reference).
 - confidence should reflect how certain you are.
 """
 
-# 场景先验知识 — 已移除，让模型零先验判断
+# 场景先验知识 — 已合并到 business_contracts，不再单独注入
+# (避免与 contracts_section 三重注入导致 FP)
 SCENE_PRIORS = {}
 
 
@@ -126,6 +192,8 @@ class DecisionAuditor:
         scene_type: str = "",
         discordance_alerts: Optional[list] = None,
         drift_info: Optional[dict] = None,
+        entity_trace_buffer: Optional[dict] = None,
+        is_cinematic: bool = False,
     ) -> VideoVerdict:
         """
         审计视频中所有实体。
@@ -135,6 +203,8 @@ class DecisionAuditor:
             scene_type: 场景类型 (用于匹配契约)
             discordance_alerts: 物理-语义矛盾警报
             drift_info: CLIP 漂移信息
+            entity_trace_buffer: entity_id → list[TraceEntry] (物理轨迹)
+            is_cinematic: 是否检测到电影/影视场景
 
         Returns:
             VideoVerdict
@@ -154,7 +224,7 @@ class DecisionAuditor:
 
         # 有漂移信号时，所有实体都需审计
         force_audit_all = False
-        if drift_info and drift_info.get("max_drift", 0) > 0.15:
+        if drift_info and drift_info.get("max_drift", 0) > 0.25:
             force_audit_all = True
             logger.info(f"Scene drift detected (max={drift_info['max_drift']:.3f}), force auditing all entities")
 
@@ -198,11 +268,15 @@ class DecisionAuditor:
 
         t0 = time.time()
 
+        _trace_buf = entity_trace_buffer or {}
+
         with ThreadPoolExecutor(max_workers=min(8, len(audit_list))) as executor:
             future_to_eid = {
                 executor.submit(
                     self._audit_single, eid, graph, scene_type,
                     discordance_alerts, drift_info,
+                    _trace_buf.get(eid, []),
+                    is_cinematic,
                 ): eid
                 for eid, graph in audit_list
             }
@@ -217,11 +291,56 @@ class DecisionAuditor:
         elapsed = time.time() - t0
         logger.info(f"Audit completed: {len(verdicts)} entities in {elapsed:.1f}s")
 
+        # ── Cinematic post-filter ──
+        # The prompt injection (Level 1) asks the LLM to set
+        # is_cinematic_false_alarm=true for non-violent movie scenes.
+        # Level 2 (here): for entities where the LLM flags anomaly but
+        # NOT cinematic, we trust the LLM's judgment (it found strong
+        # evidence of real violence). Only apply a mild attenuation (×0.7)
+        # as a safety net; the prompt is the primary mechanism.
+        if is_cinematic:
+            n_cinematic_flagged = sum(
+                1 for v in verdicts if v.is_cinematic_false_alarm
+            )
+            n_attenuated = 0
+            for v in verdicts:
+                if v.is_anomaly and not v.is_cinematic_false_alarm:
+                    old_conf = v.confidence
+                    v.confidence *= 0.7
+                    n_attenuated += 1
+                    logger.debug(
+                        f"Cinematic attenuation: Entity #{v.entity_id} "
+                        f"conf {old_conf:.2f} → {v.confidence:.2f}"
+                    )
+            if n_cinematic_flagged or n_attenuated:
+                logger.info(
+                    f"Cinematic filter: {n_cinematic_flagged} entities flagged "
+                    f"cinematic by LLM, {n_attenuated} attenuated ×0.7"
+                )
+
         # 聚合视频级结论
         anomaly_eids = [
             v.entity_id for v in verdicts
-            if v.is_anomaly and not v.is_cinematic_false_alarm
+            if v.is_anomaly
+            and not v.is_cinematic_false_alarm
+            and v.confidence >= self.cfg.anomaly_confidence_threshold
         ]
+        # 日志: 被置信度阈值过滤的实体
+        n_pre_filter = sum(
+            1 for v in verdicts
+            if v.is_anomaly and not v.is_cinematic_false_alarm
+        )
+        if n_pre_filter > len(anomaly_eids):
+            logger.info(
+                f"Confidence threshold ({self.cfg.anomaly_confidence_threshold}) "
+                f"filtered {n_pre_filter - len(anomaly_eids)} low-confidence anomaly verdicts"
+            )
+
+        # ── Multi-entity saturation suppression ──
+        anomaly_eids = self._suppress_saturation(
+            anomaly_eids, verdicts, len(audit_list), scene_type
+        )
+
         is_anomaly = len(anomaly_eids) > 0
         confidence = 0.0
         if anomaly_eids:
@@ -255,20 +374,66 @@ class DecisionAuditor:
         scene_type: str,
         discordance_alerts: Optional[list] = None,
         drift_info: Optional[dict] = None,
+        trace_entries: Optional[list] = None,
+        is_cinematic: bool = False,
     ) -> AuditVerdict:
         """审计单个实体"""
-        # 1. 生成叙事（含物理异常预警）
+        # 1. 生成叙事（含物理异常预警 + 物理轨迹摘要）
         narrative = self.narrative_gen.generate(
             graph,
             discordance_alerts=discordance_alerts,
             drift_info=drift_info,
+            trace_entries=trace_entries,
         )
 
-        # 2. 构建 prompt（无先验知识注入）
+        # 2. 构建 prompt（注入场景先验知识 + 业务契约）
+        contracts_text = self._get_contracts(scene_type)
+        scene_prior = self._get_scene_prior(scene_type)
+
+        contracts_section = ""
+        if contracts_text != "  (No specific contracts)":
+            contracts_section = (
+                f"\n## Scene Rules (prior knowledge):\n{contracts_text}\n"
+            )
+
+        contracts_reminder = ""
+        if contracts_section:
+            contracts_reminder = (
+                "\nEvaluate whether the behavior described above matches "
+                "any of the Scene Rules. Only flag as anomalous if the "
+                "evidence is clear and specific — do NOT flag routine "
+                "shopping or work activities.\n"
+            )
+
         prompt = DECISION_USER_TEMPLATE.format(
             scene_type=scene_type or "unknown",
             narrative=narrative,
+            contracts_section=contracts_section,
+            contracts_reminder=contracts_reminder,
         )
+
+        # 2.5 Cinematic context injection
+        if is_cinematic:
+            prompt += (
+                "\n⚠ IMPORTANT — CINEMATIC / ENTERTAINMENT CONTENT DETECTED: "
+                "This video is likely from a MOVIE, TV SHOW, or BROADCAST. "
+                "Be VERY skeptical about declaring anomaly. Specifically:\n"
+                "  - Dramatic tension, fearful expressions, suspense, tense "
+                "postures = NORMAL in movies. NOT anomaly.\n"
+                "  - Choreographed fight sequences, martial arts, stunt "
+                "scenes = FICTIONAL. NOT real violence.\n"
+                "  - Characters aiming weapons, car chases, explosions in "
+                "movie context = SCRIPTED. NOT real danger.\n"
+                "  - Sports (basketball falls, tackles, wrestling) = "
+                "COMPETITIVE PLAY. NOT abuse.\n"
+                "  - Injuries shown in post-action movie scenes (bandaging, "
+                "aftermath) = FICTIONAL. NOT real assault.\n"
+                "For cinematic content, set is_cinematic_false_alarm=true "
+                "UNLESS the narrative describes EXTREME EXPLICIT violence "
+                "with clear real-world victims (mass shooting, actual arson "
+                "with victims, brutal assault with visible injury). "
+                "When in doubt, default to is_cinematic_false_alarm=true.\n"
+            )
 
         # 3. 收集该实体的 discordance 峰值信息
         entity_discordance = None
@@ -279,6 +444,19 @@ class DecisionAuditor:
             ]
             if my_alerts:
                 entity_discordance = my_alerts
+                # 在 prompt 中提示 discordance 信号（保持中立，不诱导）
+                prompt += (
+                    "\n⚠ NOTE: This entity has elevated physical motion energy compared "
+                    "to what the semantic description suggests. However, high kinetic energy "
+                    "is VERY COMMON in normal activities such as sports, dancing, action "
+                    "movie scenes, military parades, fast driving, and physical exercise. "
+                    "You MUST check whether the narrative describes SPECIFIC real-world "
+                    "anomaly behaviors (actual violence with victims, actual property damage, "
+                    "actual theft, actual fire). High kinetic energy ALONE — from any form "
+                    "of vigorous but non-criminal activity — is NOT evidence of anomaly. "
+                    "If the only evidence is 'kinetic energy exceeding threshold', "
+                    "you MUST set is_anomaly=false.\n"
+                )
 
         # 4. 调用 Decision LLM
         raw_response = self._call_llm(prompt)
@@ -554,3 +732,66 @@ class DecisionAuditor:
             return "  (No specific contracts)"
 
         return "\n".join(f"  {i}. {r}" for i, r in enumerate(matched, 1))
+
+    @staticmethod
+    def _get_scene_prior(scene_type: str) -> str:
+        """获取场景先验知识提示"""
+        scene_lower = scene_type.lower().strip()
+        for key, prior in SCENE_PRIORS.items():
+            if key in scene_lower or scene_lower in key:
+                return prior
+        return ""
+
+    @staticmethod
+    def _suppress_saturation(
+        anomaly_eids: list[int],
+        verdicts: list["AuditVerdict"],
+        total_audited: int,
+        scene_type: str,
+    ) -> list[int]:
+        """
+        多实体饱和抑制：当 >50% 审计实体被标记且理由收敛于同一关键词时，
+        提高有效置信度阈值以抑制 prompt 偏置导致的 FP。
+
+        逻辑参考 discordance_checker.py 的 voting suppression。
+        """
+        if total_audited < 3 or len(anomaly_eids) < 2:
+            return anomaly_eids
+
+        ratio = len(anomaly_eids) / total_audited
+        if ratio < 0.5:
+            return anomaly_eids
+
+        # 检查是否所有异常理由收敛于同一关键词模式
+        BIAS_KEYWORDS = {
+            "shoplifting": ["shoplifting", "shoplift", "checkout", "without paying"],
+            "kinetic_energy": ["kinetic energy", "energy exceeding", "perception blind spot", "energy threshold"],
+            "sports_activity": ["basketball", "soccer", "football", "gameplay", "player", "match"],
+        }
+
+        anomaly_verdicts = [
+            v for v in verdicts if v.entity_id in anomaly_eids
+        ]
+        reasons_text = " ".join(v.reason.lower() for v in anomaly_verdicts)
+
+        for bias_name, keywords in BIAS_KEYWORDS.items():
+            keyword_hits = sum(1 for kw in keywords if kw in reasons_text)
+            if keyword_hits >= 2:
+                # 饱和检出 — 提高阈值至 0.95
+                elevated_threshold = 0.95
+                filtered = [
+                    eid for eid in anomaly_eids
+                    if any(
+                        v.entity_id == eid and v.confidence >= elevated_threshold
+                        for v in verdicts
+                    )
+                ]
+                logger.info(
+                    f"Saturation suppression: {len(anomaly_eids)}/{total_audited} "
+                    f"entities flagged as '{bias_name}' (ratio={ratio:.0%}). "
+                    f"Raising threshold to {elevated_threshold}. "
+                    f"Kept {len(filtered)}/{len(anomaly_eids)} entities."
+                )
+                return filtered
+
+        return anomaly_eids

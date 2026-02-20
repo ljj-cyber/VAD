@@ -113,24 +113,47 @@ Known anomaly categories to watch for:
   Abuse, Arrest, Arson, Assault, Burglary, Explosion, Fighting, \
   RoadAccidents, Robbery, Shooting, Shoplifting, Stealing, Vandalism.
 
-Suspicious visual cues include (but are not limited to):
+## Overt (explicit) suspicious cues:
   - Physical contact between people (hitting, grabbing, restraining, pushing)
   - Rapid or chaotic body movements (running, falling, struggling)
   - Fire, smoke, or sudden bright flashes
   - Broken objects, shattered glass, or property damage
-  - Weapons or weapon-like objects
+  - Weapons or weapon-like objects (knife, gun, bat, hammer, crowbar)
   - A person being forced or dragged
-  - Unusual postures (lying on the ground, crouching behind objects)
   - Vehicles colliding or driving erratically
 
+## Covert (subtle) suspicious cues — equally important:
+  - Shoplifting: a person picking up merchandise then concealing it in clothing, \
+bag, or pocket; looking around nervously while handling items; leaving a store \
+area without going to a checkout counter
+  - Stealing: a person reaching into another person's bag/pocket; tampering with \
+a car door/window; accessing property that likely does not belong to them; \
+taking items from an unattended area
+  - Abuse: two or more people in close proximity where one appears dominant — \
+pushing, shoving, slapping, hair-pulling, or forcing the other into a submissive \
+posture (crouching, on the ground); one person cornering or looming over another
+  - Vandalism: a person kicking, hitting, or throwing objects at property \
+(walls, cars, windows, signs, furniture); spray-painting surfaces; \
+smashing or breaking fixtures; tearing down objects
+
 Rules:
-- "box_action": Describe the visible action of the highlighted entity. Be specific \
-about body interactions (e.g. "grabbing another person's arm" not just "standing").
-- "context_relation": Describe the visible surroundings and any interaction between entities.
-- "scene_type": the overall scene type (e.g. indoor, outdoor, road, parking lot, etc.).
-- "is_suspicious": true if you observe ANY of the above cues, false otherwise.
-- "danger_score": a float 0.0-1.0. Score ≥0.3 if any suspicious cue is present; \
-≥0.6 if the cue is strong (e.g. visible fighting, fire, weapon); ≥0.8 for extreme danger.
+- "box_action": Describe the visible action of the highlighted entity. Be SPECIFIC \
+about body interactions and person-object interactions (e.g. "grabbing another \
+person's arm" not just "standing"; "tucking an item into jacket" not just "browsing"). \
+Avoid generic labels like "standing" or "walking" when more specific descriptions apply — \
+describe hand-object interactions, person-person contact, body postures that suggest \
+aggression, fear, or stealth.
+- "context_relation": Describe the visible surroundings, interactions between entities, \
+and any objects being handled or affected.
+- "scene_type": the overall scene type (e.g. indoor, outdoor, road, parking lot, \
+store, office, etc.).
+- "is_suspicious": true if you observe ANY overt OR covert cue listed above.
+- "danger_score": a float 0.0-1.0. Score ≥0.3 if any suspicious cue (overt or covert) \
+is present; ≥0.6 if the cue is strong; ≥0.8 for extreme danger.
+- "anomaly_category_guess": If is_suspicious=true, guess which anomaly category this \
+MIGHT belong to (one of: Abuse, Arrest, Arson, Assault, Burglary, Explosion, Fighting, \
+RoadAccidents, Robbery, Shooting, Shoplifting, Stealing, Vandalism). If not suspicious, \
+output "none".
 - Output ONLY JSON, no extra text.
 """
 
@@ -148,7 +171,8 @@ Describe what you see. Output ONLY JSON:
   "posture": "<body posture>",
   "scene_context": "<environment type>",
   "is_suspicious": <true|false>,
-  "danger_score": <float 0.0-1.0>
+  "danger_score": <float 0.0-1.0>,
+  "anomaly_category_guess": "<category or none>"
 }}
 """
 
@@ -164,7 +188,7 @@ Known anomaly categories to watch for:
   Abuse, Arrest, Arson, Assault, Burglary, Explosion, Fighting, \
   RoadAccidents, Robbery, Shooting, Shoplifting, Stealing, Vandalism.
 
-Suspicious temporal cues include (but are not limited to):
+## Overt temporal cues:
   - A person suddenly falls, gets hit, or is restrained across frames
   - Fire or smoke appearing or growing between frames
   - Rapid movement escalation (calm → running/struggling)
@@ -172,12 +196,32 @@ Suspicious temporal cues include (but are not limited to):
   - Vehicles colliding or swerving
   - A crowd scattering or people fleeing
 
+## Covert (subtle) temporal cues — equally important:
+  - Shoplifting: an item visible on a shelf/counter in early frames disappears in \
+later frames while a person is nearby; a person picks up an item then hides it \
+under clothing or in a bag across frames
+  - Stealing: a person approaches another person's belongings or vehicle, makes \
+contact with it, then moves away; an object transfers between people or locations \
+without an obvious transaction
+  - Abuse: interaction between people escalates from neutral proximity to one person \
+physically dominating the other (pushing down, striking, cornering); one person \
+collapses or cowers while another stands over them
+  - Vandalism: a person makes physical contact with property (wall, car, sign) in a \
+striking/kicking/spray motion across frames; property visibly changes \
+(new marks, broken pieces, displaced objects)
+
 Rules:
 - Describe what CHANGES between frames (not just what's visible in one frame).
-- "action": describe the temporal action across frames. Be specific about interactions.
-- "is_suspicious": true if you observe ANY of the above cues across the 4 frames.
+- "action": describe the temporal action across frames. Be SPECIFIC about interactions — \
+describe hand-object contacts, person-person physical contact, body posture changes \
+suggesting aggression/fear/stealth. Avoid generic terms like "standing" or "walking".
+- "is_suspicious": true if you observe ANY overt OR covert cue across the 4 frames.
 - "danger_score": based on the SEQUENCE. Score ≥0.3 if suspicious cues emerge; \
 ≥0.6 for clear anomaly progression; ≥0.8 for extreme danger.
+- "anomaly_category_guess": If is_suspicious=true, guess which anomaly category this \
+MIGHT belong to (one of: Abuse, Arrest, Arson, Assault, Burglary, Explosion, Fighting, \
+RoadAccidents, Robbery, Shooting, Shoplifting, Stealing, Vandalism). If not suspicious, \
+output "none".
 - Output ONLY JSON, no extra text.
 """
 
@@ -195,7 +239,8 @@ Describe what happens over these frames. Output ONLY JSON:
   "posture": "<body posture in latest frame>",
   "scene_context": "<environment type>",
   "is_suspicious": <true|false>,
-  "danger_score": <float 0.0-1.0>
+  "danger_score": <float 0.0-1.0>,
+  "anomaly_category_guess": "<category or none>"
 }}
 """
 
@@ -263,7 +308,8 @@ class SemanticVLLM:
             tr = triggers[idx]
 
             # 选择输入图像和 Prompt:
-            # 优先级: grid_images(多帧) > painted_images(带框全图) > crop
+            # 优先级: grid_images(多帧) > painted_images(带框全图)
+            # 若两者均不可用，直接返回 fallback
             pil_img = None
             use_grid = False
 
@@ -273,16 +319,16 @@ class SemanticVLLM:
             elif painted_images and tr.frame_idx in painted_images:
                 pil_img = painted_images[tr.frame_idx]
             else:
-                crop = tr.trace_entry.crop_image
-                if crop is None:
-                    return idx, self._fallback_result(tr)
-                h, w = crop.shape[:2]
-                target = self.cfg.crop_resize
-                if (w, h) != target:
-                    crop = cv2.resize(crop, target, interpolation=cv2.INTER_LINEAR)
-                pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                return idx, self._fallback_result(tr)
 
-            b64 = _pil_to_base64(pil_img)
+            try:
+                b64 = _pil_to_base64(pil_img)
+            except Exception as e:
+                logger.warning(
+                    f"Image encoding failed for entity #{tr.entity_id} "
+                    f"at frame {tr.frame_idx}: {e}"
+                )
+                return idx, self._fallback_result(tr)
 
             # 根据输入类型选择 Prompt
             if use_grid:
@@ -342,10 +388,29 @@ class SemanticVLLM:
             with ThreadPoolExecutor(max_workers=self.cfg.max_workers) as executor:
                 futures = {executor.submit(_request_one, i): i for i in range(len(triggers))}
                 for future in as_completed(futures):
-                    idx, result = future.result()
-                    results[idx] = result
+                    i = futures[future]
+                    try:
+                        idx, result = future.result()
+                        results[idx] = result
+                    except Exception as e:
+                        tr = triggers[i]
+                        logger.warning(
+                            f"Semantic VLLM future failed for entity #{tr.entity_id} "
+                            f"at frame {tr.frame_idx}: {e}"
+                        )
+                        results[i] = self._fallback_result(tr)
         finally:
             client.close()
+
+        # 安全兜底: 确保无 None 残留
+        for i, r in enumerate(results):
+            if r is None:
+                tr = triggers[i]
+                logger.warning(
+                    f"Semantic VLLM result was None for entity #{tr.entity_id} "
+                    f"at frame {tr.frame_idx} — using fallback"
+                )
+                results[i] = self._fallback_result(tr)
 
         elapsed = time.time() - t0
         logger.info(
@@ -372,6 +437,8 @@ class SemanticVLLM:
 
         for i, tr in enumerate(triggers):
             # 选择输入图像和 Prompt
+            # 优先级: grid_images(多帧) > painted_images(带框全图)
+            # 若两者均不可用，直接返回 fallback
             pil_img = None
             use_grid = False
 
@@ -381,15 +448,8 @@ class SemanticVLLM:
             elif painted_images and tr.frame_idx in painted_images:
                 pil_img = painted_images[tr.frame_idx]
             else:
-                crop = tr.trace_entry.crop_image
-                if crop is None:
-                    results.append(self._fallback_result(tr))
-                    continue
-                h, w = crop.shape[:2]
-                target = self.cfg.crop_resize
-                if (w, h) != target:
-                    crop = cv2.resize(crop, target, interpolation=cv2.INTER_LINEAR)
-                pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                results.append(self._fallback_result(tr))
+                continue
 
             # 根据输入类型选择 Prompt
             if use_grid:
@@ -474,6 +534,7 @@ class SemanticVLLM:
             "scene_context": str(data.get("scene_context", data.get("scene_type", "unknown"))),
             "is_suspicious": bool(data.get("is_suspicious", False)),
             "danger_score": float(data.get("danger_score", 0.0)),
+            "anomaly_category_guess": str(data.get("anomaly_category_guess", "none")),
         }
 
     @staticmethod
@@ -487,6 +548,7 @@ class SemanticVLLM:
             "scene_context": "unknown",
             "is_suspicious": False,
             "danger_score": 0.0,
+            "anomaly_category_guess": "none",
         }
 
     def _fallback_result(self, tr: TriggerResult) -> dict:

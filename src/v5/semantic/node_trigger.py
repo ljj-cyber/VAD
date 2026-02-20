@@ -148,6 +148,74 @@ class NodeTrigger:
             "embedding": entry.embedding.copy(),
         }
 
+    def check_heartbeat_for_active(
+        self,
+        active_entity_ids: list[int],
+        current_timestamp: float,
+        current_frame_idx: int,
+        entity_trace_buffer: dict[int, list],
+        triggered_eids: set[int] | None = None,
+    ) -> list[TriggerResult]:
+        """
+        对不在当前帧 regions 中的活跃实体，检查是否需要心跳触发。
+
+        当实体不再产生运动区域（停止运动或遮挡），仍可通过心跳
+        拿到新的语义节点，使动态图产生 Edge。
+
+        Args:
+            active_entity_ids: 当前活跃实体 ID 列表
+            current_timestamp: 当前帧时间戳 (秒)
+            current_frame_idx: 当前帧序号
+            entity_trace_buffer: entity_id → list[TraceEntry]
+            triggered_eids: 当前帧已经触发过的实体 ID (跳过)
+
+        Returns:
+            list[TriggerResult]
+        """
+        triggered_eids = triggered_eids or set()
+        triggers: list[TriggerResult] = []
+
+        for eid in active_entity_ids:
+            if eid in triggered_eids:
+                continue
+
+            last = self._last_sample.get(eid)
+            if last is None:
+                continue
+
+            # 心跳间隔检查
+            time_since = current_timestamp - last["timestamp"]
+            if time_since < self.cfg.heartbeat_interval_sec:
+                continue
+
+            # 用实体最近一条 trace entry 作为代理
+            buf = entity_trace_buffer.get(eid, [])
+            if not buf:
+                continue
+            last_entry = buf[-1]
+
+            # 计算 embedding 距离
+            cos_sim = float(np.dot(last_entry.embedding, last["embedding"]))
+            distance = 1.0 - cos_sim
+
+            # 更新采样点
+            self._last_sample[eid] = {
+                "frame_idx": current_frame_idx,
+                "timestamp": current_timestamp,
+                "embedding": last_entry.embedding.copy(),
+            }
+
+            triggers.append(TriggerResult(
+                entity_id=eid,
+                frame_idx=current_frame_idx,
+                timestamp=current_timestamp,
+                trigger_rule="heartbeat",
+                embedding_distance=round(distance, 4),
+                trace_entry=last_entry,
+            ))
+
+        return triggers
+
     def get_trigger_stats(self) -> dict:
         """统计信息"""
         return {

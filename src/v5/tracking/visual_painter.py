@@ -74,7 +74,7 @@ class VisualPainter:
     def paint(
         self,
         frame: np.ndarray,
-        regions: list[MotionRegion],
+        regions: list,
         entity_ids: Optional[list[int]] = None,
     ) -> Image.Image:
         """
@@ -82,7 +82,7 @@ class VisualPainter:
 
         Args:
             frame: BGR 原图 (H, W, 3)
-            regions: 当前帧的 MotionRegion 列表
+            regions: 当前帧的 MotionRegion 或 HybridRegion 列表
             entity_ids: 对应的 entity_id 列表（可选）
 
         Returns:
@@ -93,7 +93,11 @@ class VisualPainter:
         for i, region in enumerate(regions):
             eid = entity_ids[i] if entity_ids and i < len(entity_ids) else i
             color = _energy_color(region.kinetic_energy)
-            label = f"E#{eid} [{_energy_label(region.kinetic_energy)}]"
+            # 如果有 YOLO 类别信息，附加到标签
+            cls_tag = ""
+            if hasattr(region, "class_name") and region.class_name:
+                cls_tag = f" {region.class_name}"
+            label = f"E#{eid}{cls_tag} [{_energy_label(region.kinetic_energy)}]"
 
             # 画框
             x1, y1 = region.x, region.y

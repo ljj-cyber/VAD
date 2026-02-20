@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EventVAD V5 — 视频异常检测可视化系统</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
+          colors: {
+            brand: { 50:'#eff6ff',100:'#dbeafe',200:'#bfdbfe',500:'#3b82f6',600:'#2563eb',700:'#1d4ed8' },
+            danger: { DEFAULT:'#ef4444', light:'#fca5a5', dark:'#991b1b' },
+            warning: { DEFAULT:'#f59e0b', light:'#fcd34d', dark:'#92400e' },
+            surface: { 0:'#0f172a', 1:'#1e293b', 2:'#334155', 3:'#475569' },
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body { font-family: 'Inter', system-ui, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #1e293b; }
+    ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+    .heatmap-bar { height: 8px; transition: all 0.15s; }
+    .heatmap-bar.danger { background: #ef4444; }
+    .heatmap-bar.warning { background: #f59e0b; }
+    .heatmap-bar.normal { background: #334155; }
+    .heatmap-bar:hover { height: 14px; margin-top: -3px; }
+    .node-birth { background: #22c55e; border-color: #16a34a; }
+    .node-change { background: #f59e0b; border-color: #d97706; }
+    .node-heartbeat { background: #3b82f6; border-color: #2563eb; }
+    .node-suspicious { box-shadow: 0 0 12px rgba(239,68,68,0.6); }
+    @keyframes pulse-warning { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .pulse-warn { animation: pulse-warning 1.2s infinite; }
+    .graph-edge { stroke-linecap: round; }
+    .fade-in { animation: fadeIn 0.3s ease-in; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+  </style>
+</head>
+<body class="bg-surface-0 text-gray-100 min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel" data-type="module">
+    const { useState, useEffect, useRef, useCallback, useMemo } = React;
+    const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, ReferenceLine, ReferenceArea, Legend } = Recharts;
+
+    // API 后端地址 — 前端独立运行(8502)时连后端 8501
+    const API_BASE = (() => {
+      const port = window.location.port;
+      const host = window.location.hostname;
+      // 如果是从后端 8501 直接访问（/），API 就在同源
+      if (port === '8501') return '';
+      // 否则指向 8501
+      return `http://${host}:8501`;
+    })();
+
+    // ── Utility ──
+    async function apiFetch(path) {
+      const resp = await fetch(`${API_BASE}${path}`);
+      if (!resp.ok) throw new Error(`API Error: ${resp.status}`);
+      return resp.json();
+    }
+
+    function formatTime(sec) {
+      if (sec == null) return '--';
+      const m = Math.floor(sec / 60);
+      const s = (sec % 60).toFixed(1);
+      return `${m}:${s.padStart(4, '0')}`;
+    }
+
+    const TRIGGER_COLORS = {
+      birth: { bg: 'bg-green-500', border: 'border-green-400', text: 'text-green-400', hex: '#22c55e' },
+      change_point: { bg: 'bg-amber-500', border: 'border-amber-400', text: 'text-amber-400', hex: '#f59e0b' },
+      heartbeat: { bg: 'bg-blue-500', border: 'border-blue-400', text: 'text-blue-400', hex: '#3b82f6' },
+    };
+
+    // ══════════════════════════════════════════════════════
+    // 主应用
+    // ══════════════════════════════════════════════════════
+    function App() {
+      const [videos, setVideos] = useState([]);
+      const [selectedVideo, setSelectedVideo] = useState(null);
+      const [loading, setLoading] = useState(true);
+
+      useEffect(() => {
+        apiFetch('/api/videos').then(data => {
+          setVideos(data.videos || []);
+          setLoading(false);
+        }).catch(() => setLoading(false));
+      }, []);
+
+      if (loading) return <LoadingScreen />;
+      if (!selectedVideo) return <VideoSelector videos={videos} onSelect={setSelectedVideo} />;
+      return <Dashboard videoName={selectedVideo} onBack={() => setSelectedVideo(null)} />;
+    }
+
+    // ── 加载屏 ──
+    function LoadingScreen() {
+      return (
+        <div className="flex items-center justify-center min-h-screen">
+          <div className="text-center">
+            <div className="w-12 h-12 border-4 border-brand-500 border-t-transparent rounded-full animate-spin mx-auto mb-4" />
+            <p className="text-gray-400">加载中...</p>
+          </div>
+        </div>
+      );
+    }
+
+    // ── 视频选择器 ──
+    function VideoSelector({ videos, onSelect }) {
+      const [search, setSearch] = useState('');
+      const filtered = videos.filter(v => v.name.toLowerCase().includes(search.toLowerCase()));
+
+      return (
+        <div className="min-h-screen p-8">
+          <div className="max-w-6xl mx-auto">
+            <div className="text-center mb-12">
+              <h1 className="text-4xl font-bold bg-gradient-to-r from-brand-500 to-purple-500 bg-clip-text text-transparent mb-3">
+                EventVAD V5
+              </h1>
+              <p className="text-gray-400 text-lg">视频异常检测可视化系统</p>
+            </div>
+
+            <div className="mb-6">
+              <input
+                type="text"
+                placeholder="搜索视频..."
+                value={search}
+                onChange={e => setSearch(e.target.value)}
+                className="w-full max-w-md mx-auto block px-4 py-3 bg-surface-1 border border-surface-2 rounded-lg focus:border-brand-500 focus:outline-none text-gray-200"
+              />
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              {filtered.map(v => (
+                <button
+                  key={v.name}
+                  onClick={() => onSelect(v.name)}
+                  className="bg-surface-1 hover:bg-surface-2 border border-surface-2 hover:border-brand-500 rounded-xl p-5 text-left transition-all group"
+                >
+                  <div className="flex items-center gap-3 mb-2">
+                    <div className="w-3 h-3 rounded-full bg-brand-500 group-hover:scale-125 transition-transform" />
+                    <span className="font-semibold text-sm truncate">{v.name}</span>
+                  </div>
+                  <div className="flex gap-2 mt-3">
+                    {v.has_result && <span className="text-xs px-2 py-0.5 bg-green-900/40 text-green-400 rounded">已分析</span>}
+                    {v.has_demo && <span className="text-xs px-2 py-0.5 bg-blue-900/40 text-blue-400 rounded">Demo</span>}
+                  </div>
+                </button>
+              ))}
+            </div>
+            {filtered.length === 0 && (
+              <p className="text-center text-gray-500 mt-8">未找到匹配的视频</p>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ══════════════════════════════════════════════════════
+    // 主仪表盘
+    // ══════════════════════════════════════════════════════
+    function Dashboard({ videoName, onBack }) {
+      const [metadata, setMetadata] = useState(null);
+      const [entities, setEntities] = useState(null);
+      const [narrative, setNarrative] = useState(null);
+      const [triggers, setTriggers] = useState(null);
+      const [heatmap, setHeatmap] = useState(null);
+      const [currentTime, setCurrentTime] = useState(0);
+      const [selectedEntity, setSelectedEntity] = useState(null);
+      const [selectedNode, setSelectedNode] = useState(null);
+      const [loading, setLoading] = useState(true);
+
+      useEffect(() => {
+        setLoading(true);
+        Promise.all([
+          apiFetch(`/api/video/${videoName}/metadata`),
+          apiFetch(`/api/video/${videoName}/entities`),
+          apiFetch(`/api/audit/${videoName}/narrative`),
+          apiFetch(`/api/video/${videoName}/triggers`),
+          apiFetch(`/api/video/${videoName}/heatmap?bins=200`),
+        ]).then(([meta, ent, narr, trig, heat]) => {
+          setMetadata(meta);
+          setEntities(ent);
+          setNarrative(narr);
+          setTriggers(trig);
+          setHeatmap(heat);
+          setLoading(false);
+        }).catch(err => {
+          console.error(err);
+          setLoading(false);
+        });
+      }, [videoName]);
+
+      const handleSeek = useCallback((time) => {
+        setCurrentTime(time);
+      }, []);
+
+      const handleNodeClick = useCallback((node, entityId) => {
+        setSelectedNode(node);
+        setSelectedEntity(entityId);
+        if (node.timestamp != null) {
+          setCurrentTime(node.timestamp);
+        }
+      }, []);
+
+      const handleEntitySelect = useCallback((eid) => {
+        setSelectedEntity(eid);
+        setSelectedNode(null);
+      }, []);
+
+      if (loading) return <LoadingScreen />;
+
+      return (
+        <div className="min-h-screen flex flex-col">
+          {/* 顶部栏 */}
+          <header className="bg-surface-1 border-b border-surface-2 px-6 py-3 flex items-center gap-4 shrink-0">
+            <button onClick={onBack} className="text-gray-400 hover:text-white transition">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+            </button>
+            <h1 className="font-semibold text-lg">{videoName}</h1>
+            {metadata?.is_anomaly ? (
+              <span className="ml-auto px-3 py-1 bg-red-900/50 text-red-400 rounded-full text-sm font-medium flex items-center gap-1.5">
+                <span className="w-2 h-2 bg-red-500 rounded-full pulse-warn" />
+                异常 (置信度 {(metadata.confidence * 100).toFixed(0)}%)
+              </span>
+            ) : (
+              <span className="ml-auto px-3 py-1 bg-green-900/50 text-green-400 rounded-full text-sm font-medium">
+                正常
+              </span>
+            )}
+            <div className="text-xs text-gray-500 ml-4 hidden md:block">
+              {metadata?.total_frames} 帧 | {metadata?.fps} FPS | {formatTime(metadata?.video_duration_sec)}
+            </div>
+          </header>
+
+          {/* 主内容 */}
+          <div className="flex-1 grid grid-cols-12 gap-0 overflow-hidden" style={{height:'calc(100vh - 56px)'}}>
+            {/* 左侧：视频 + 动能图 */}
+            <div className="col-span-8 flex flex-col border-r border-surface-2 overflow-auto">
+              {/* 视频播放器 */}
+              <div className="p-4 shrink-0">
+                <AugmentedPlayer
+                  videoName={videoName}
+                  metadata={metadata}
+                  heatmap={heatmap}
+                  currentTime={currentTime}
+                  onTimeUpdate={setCurrentTime}
+                  onSeek={handleSeek}
+                />
+              </div>
+
+              {/* 动能折线图 */}
+              <div className="px-4 pb-4 flex-1 min-h-[280px]">
+                <KineticChart
+                  videoName={videoName}
+                  entities={entities}
+                  selectedEntity={selectedEntity}
+                  currentTime={currentTime}
+                  onSeek={handleSeek}
+                  narrative={narrative}
+                />
+              </div>
+            </div>
+
+            {/* 右侧：演化图 + 审计面板 */}
+            <div className="col-span-4 flex flex-col overflow-auto">
+              {/* 演化图看板 */}
+              <div className="p-4 border-b border-surface-2 shrink-0">
+                <EvolutionGraph
+                  entities={entities}
+                  triggers={triggers}
+                  selectedEntity={selectedEntity}
+                  selectedNode={selectedNode}
+                  onNodeClick={handleNodeClick}
+                  onEntitySelect={handleEntitySelect}
+                  currentTime={currentTime}
+                />
+              </div>
+
+              {/* 审计叙事面板 */}
+              <div className="p-4 flex-1 overflow-auto">
+                <AuditPanel
+                  narrative={narrative}
+                  selectedEntity={selectedEntity}
+                  onSeek={handleSeek}
+                  onEntitySelect={handleEntitySelect}
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ══════════════════════════════════════════════════════
+    // A. 增强型视频播放器
+    // ══════════════════════════════════════════════════════
+    function AugmentedPlayer({ videoName, metadata, heatmap, currentTime, onTimeUpdate, onSeek }) {
+      const videoRef = useRef(null);
+      const canvasRef = useRef(null);
+      const [bboxes, setBboxes] = useState([]);
+      const [isPlaying, setIsPlaying] = useState(false);
+      const [hoveredBbox, setHoveredBbox] = useState(null);
+      const lastFetchTime = useRef(-1);
+      const duration = metadata?.video_duration_sec || 0;
+
+      // 同步外部 currentTime 到视频
+      useEffect(() => {
+        const video = videoRef.current;
+        if (video && Math.abs(video.currentTime - currentTime) > 1) {
+          video.currentTime = currentTime;
+        }
+      }, [currentTime]);
+
+      // 视频时间更新 → 拉取 bbox
+      const handleTimeUpdate = useCallback(() => {
+        const video = videoRef.current;
+        if (!video) return;
+        const t = video.currentTime;
+        onTimeUpdate(t);
+
+        // 每 0.5s 拉一次 bbox
+        if (Math.abs(t - lastFetchTime.current) >= 0.5) {
+          lastFetchTime.current = t;
+          apiFetch(`/api/video/${videoName}/bboxes?t=${t.toFixed(2)}`)
+            .then(data => setBboxes(data.bboxes || []))
+            .catch(() => {});
+        }
+      }, [videoName, onTimeUpdate]);
+
+      // Canvas 叠加绘制
+      useEffect(() => {
+        const canvas = canvasRef.current;
+        const video = videoRef.current;
+        if (!canvas || !video) return;
+
+        const ctx = canvas.getContext('2d');
+        canvas.width = video.clientWidth;
+        canvas.height = video.clientHeight;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (!bboxes.length) return;
+
+        const scaleX = canvas.width / (video.videoWidth || 1);
+        const scaleY = canvas.height / (video.videoHeight || 1);
+
+        bboxes.forEach(b => {
+          if (!b.bbox || b.bbox.length < 4) return;
+          const [x, y, w, h] = b.bbox.map(Number);
+          const sx = x * scaleX, sy = y * scaleY, sw = w * scaleX, sh = h * scaleY;
+
+          const isHovered = hoveredBbox === b.entity_id;
+          ctx.strokeStyle = isHovered ? '#fbbf24' : '#ef4444';
+          ctx.lineWidth = isHovered ? 3 : 2;
+          ctx.strokeRect(sx, sy, sw, sh);
+
+          // 标签
+          const label = `E${b.entity_id} ${b.action || ''}`;
+          ctx.font = `${isHovered ? 'bold ' : ''}11px Inter, sans-serif`;
+          const metrics = ctx.measureText(label);
+          ctx.fillStyle = 'rgba(0,0,0,0.7)';
+          ctx.fillRect(sx, sy - 18, metrics.width + 8, 18);
+          ctx.fillStyle = isHovered ? '#fbbf24' : '#fff';
+          ctx.fillText(label, sx + 4, sy - 5);
+        });
+      }, [bboxes, hoveredBbox]);
+
+      const handleCanvasMove = useCallback((e) => {
+        const canvas = canvasRef.current;
+        const video = videoRef.current;
+        if (!canvas || !video || !bboxes.length) return;
+
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const my = e.clientY - rect.top;
+        const scaleX = canvas.width / (video.videoWidth || 1);
+        const scaleY = canvas.height / (video.videoHeight || 1);
+
+        let found = null;
+        for (const b of bboxes) {
+          if (!b.bbox || b.bbox.length < 4) continue;
+          const [x, y, w, h] = b.bbox.map(Number);
+          const sx = x * scaleX, sy = y * scaleY, sw = w * scaleX, sh = h * scaleY;
+          if (mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh) {
+            found = b.entity_id;
+            break;
+          }
+        }
+        setHoveredBbox(found);
+      }, [bboxes]);
+
+      const togglePlay = () => {
+        const v = videoRef.current;
+        if (!v) return;
+        if (v.paused) { v.play(); setIsPlaying(true); }
+        else { v.pause(); setIsPlaying(false); }
+      };
+
+      const handleHeatmapClick = (bin) => {
+        if (bin.t_start != null) onSeek(bin.t_start);
+      };
+
+      return (
+        <div className="fade-in">
+          <div className="relative bg-black rounded-lg overflow-hidden group">
+            <video
+              ref={videoRef}
+              src={`${API_BASE}/api/video/${videoName}/file`}
+              className="w-full"
+              onTimeUpdate={handleTimeUpdate}
+              onPlay={() => setIsPlaying(true)}
+              onPause={() => setIsPlaying(false)}
+              style={{maxHeight: '360px', objectFit: 'contain', background: '#000'}}
+            />
+            <canvas
+              ref={canvasRef}
+              className="absolute inset-0 w-full h-full pointer-events-auto cursor-crosshair"
+              onMouseMove={handleCanvasMove}
+              onClick={togglePlay}
+            />
+            {/* 播放/暂停按钮 */}
+            <div className="absolute bottom-3 left-3 flex items-center gap-3 opacity-0 group-hover:opacity-100 transition-opacity">
+              <button onClick={togglePlay} className="w-8 h-8 bg-black/60 rounded-full flex items-center justify-center text-white hover:bg-black/80">
+                {isPlaying ? '⏸' : '▶'}
+              </button>
+              <span className="text-xs text-white/80 bg-black/40 px-2 py-0.5 rounded">
+                {formatTime(currentTime)} / {formatTime(duration)}
+              </span>
+            </div>
+          </div>
+
+          {/* 进度条 + 热图 */}
+          <div className="mt-2">
+            <input
+              type="range"
+              min={0}
+              max={duration}
+              step={0.1}
+              value={currentTime}
+              onChange={e => onSeek(parseFloat(e.target.value))}
+              className="w-full h-1 appearance-none bg-surface-2 rounded cursor-pointer"
+              style={{accentColor: '#3b82f6'}}
+            />
+            {heatmap && (
+              <div className="flex gap-px mt-1 rounded overflow-hidden">
+                {heatmap.heatmap.map((bin, i) => (
+                  <div
+                    key={i}
+                    className={`heatmap-bar flex-1 cursor-pointer ${bin.level}`}
+                    onClick={() => handleHeatmapClick(bin)}
+                    title={`${formatTime(bin.t_start)} - ${bin.level === 'danger' ? '异常' : bin.level === 'warning' ? '可疑' : '正常'}`}
+                  />
+                ))}
+              </div>
+            )}
+            <div className="flex justify-between text-xs text-gray-500 mt-1">
+              <span>0:00</span>
+              <div className="flex gap-3">
+                <span className="flex items-center gap-1"><span className="w-2 h-2 bg-red-500 rounded-sm" />异常</span>
+                <span className="flex items-center gap-1"><span className="w-2 h-2 bg-amber-500 rounded-sm" />可疑</span>
+                <span className="flex items-center gap-1"><span className="w-2 h-2 bg-surface-2 rounded-sm" />正常</span>
+              </div>
+              <span>{formatTime(duration)}</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ══════════════════════════════════════════════════════
+    // B. 动态演化图看板
+    // ══════════════════════════════════════════════════════
+    function EvolutionGraph({ entities, triggers, selectedEntity, selectedNode, onNodeClick, onEntitySelect, currentTime }) {
+      if (!entities?.entities?.length) {
+        return <div className="text-gray-500 text-sm">无实体数据</div>;
+      }
+
+      const entList = entities.entities;
+
+      return (
+        <div className="fade-in">
+          <h2 className="text-sm font-semibold text-gray-300 mb-3 flex items-center gap-2">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+            动态演化图
+          </h2>
+
+          {/* 图例 */}
+          <div className="flex gap-3 mb-3 text-xs text-gray-400">
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-green-500" />Birth</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-amber-500" />Change</span>
+            <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded-full bg-blue-500" />Heartbeat</span>
+          </div>
+
+          {/* 实体选择标签 */}
+          <div className="flex gap-1.5 mb-3 flex-wrap">
+            <button
+              onClick={() => onEntitySelect(null)}
+              className={`text-xs px-2 py-1 rounded-md transition ${selectedEntity == null ? 'bg-brand-600 text-white' : 'bg-surface-2 text-gray-400 hover:text-white'}`}
+            >
+              全部
+            </button>
+            {entList.map(e => (
+              <button
+                key={e.entity_id}
+                onClick={() => onEntitySelect(e.entity_id)}
+                className={`text-xs px-2 py-1 rounded-md transition flex items-center gap-1 ${
+                  selectedEntity === e.entity_id
+                    ? 'bg-brand-600 text-white'
+                    : 'bg-surface-2 text-gray-400 hover:text-white'
+                }`}
+              >
+                E{e.entity_id}
+                {e.is_anomaly && <span className="w-1.5 h-1.5 bg-red-500 rounded-full" />}
+              </button>
+            ))}
+          </div>
+
+          {/* 节点网格 */}
+          <div className="space-y-3 max-h-[300px] overflow-y-auto pr-1">
+            {entList
+              .filter(e => selectedEntity == null || e.entity_id === selectedEntity)
+              .map(entity => (
+                <EntityGraphRow
+                  key={entity.entity_id}
+                  entity={entity}
+                  selectedNode={selectedNode}
+                  onNodeClick={onNodeClick}
+                  currentTime={currentTime}
+                  videoName={entities?.video_name}
+                />
+              ))
+            }
+          </div>
+        </div>
+      );
+    }
+
+    function NodeDetail({ node, entityId, videoName }) {
+      const [imgType, setImgType] = useState('grid');
+      // Try to infer frame_idx from trigger data
+      const frameIdx = node.frame_idx || 0;
+
+      return (
+        <div className="mt-2 p-2 bg-surface-0 rounded text-xs text-gray-300 space-y-2">
+          <div className="flex justify-between">
+            <span>时间: <strong className="text-white">{node.timestamp?.toFixed(1)}s</strong></span>
+            <span>触发: <span className={TRIGGER_COLORS[node.trigger_rule]?.text || 'text-gray-400'}>{node.trigger_rule}</span></span>
+          </div>
+          <div>动作: <strong className="text-white">{node.action}</strong> {node.action_object && node.action_object !== 'none' ? `(${node.action_object})` : ''}</div>
+          <div className="flex justify-between">
+            <span>危险度: <span className={node.danger_score >= 0.5 ? 'text-red-400 font-semibold' : 'text-gray-400'}>{node.danger_score?.toFixed(2)}</span></span>
+            <span>动能: {node.kinetic_energy?.toFixed(4)}</span>
+          </div>
+          <div>姿态: {node.posture} | 场景: {node.scene_context}</div>
+          {node.is_suspicious && (
+            <div className="text-red-400 font-semibold flex items-center gap-1">
+              <span className="pulse-warn">⚠</span> 标记为可疑
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function EntityGraphRow({ entity, selectedNode, onNodeClick, currentTime, videoName }) {
+      const graph = entity.graph || {};
+      const nodes = graph.nodes || [];
+      const edges = graph.edges || [];
+
+      return (
+        <div className="bg-surface-1 rounded-lg p-3">
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-xs font-semibold text-gray-300">Entity #{entity.entity_id}</span>
+            {entity.is_anomaly && (
+              <span className="text-xs px-1.5 py-0.5 bg-red-900/50 text-red-400 rounded">异常</span>
+            )}
+            <span className="text-xs text-gray-500 ml-auto">{nodes.length} 节点</span>
+          </div>
+
+          {/* 时间轴节点 */}
+          <div className="flex items-center gap-1 overflow-x-auto pb-1">
+            {nodes.map((node, idx) => {
+              const rule = node.trigger_rule || 'heartbeat';
+              const colors = TRIGGER_COLORS[rule] || TRIGGER_COLORS.heartbeat;
+              const isSelected = selectedNode?.node_id === node.node_id;
+              const isNearCurrent = Math.abs((node.timestamp || 0) - currentTime) < 1.5;
+              const isSuspicious = node.is_suspicious;
+
+              return (
+                <React.Fragment key={node.node_id}>
+                  {idx > 0 && (
+                    <div className="flex-shrink-0 h-0.5 bg-surface-3" style={{
+                      width: Math.max(8, Math.min(40, (edges[idx-1]?.kinetic_integral || 0.01) * 200)),
+                    }} />
+                  )}
+                  <button
+                    onClick={() => onNodeClick(node, entity.entity_id)}
+                    className={`flex-shrink-0 w-7 h-7 rounded-full border-2 text-[9px] font-bold flex items-center justify-center transition-all
+                      ${colors.bg} ${colors.border}
+                      ${isSelected ? 'ring-2 ring-white scale-125' : ''}
+                      ${isNearCurrent ? 'ring-2 ring-brand-500' : ''}
+                      ${isSuspicious ? 'node-suspicious' : ''}
+                    `}
+                    title={`T=${node.timestamp?.toFixed(1)}s | ${node.action} | danger=${node.danger_score}`}
+                  >
+                    {idx}
+                  </button>
+                </React.Fragment>
+              );
+            })}
+          </div>
+
+          {/* 选中节点详情 */}
+          {selectedNode && nodes.find(n => n.node_id === selectedNode.node_id) && (
+            <NodeDetail node={selectedNode} videoName={entity.graph?.nodes?.[0]?.scene_context} entityId={entity.entity_id} />
+          )}
+        </div>
+      );
+    }
+
+    // ══════════════════════════════════════════════════════
+    // C. 动能折线图
+    // ══════════════════════════════════════════════════════
+    function KineticChart({ videoName, entities, selectedEntity, currentTime, onSeek, narrative }) {
+      const [trajectories, setTrajectories] = useState({});
+      const [loadingTrajs, setLoadingTrajs] = useState(false);
+
+      const entityIds = useMemo(() => {
+        if (!entities?.entities) return [];
+        return entities.entities.map(e => e.entity_id);
+      }, [entities]);
+
+      useEffect(() => {
+        if (!entityIds.length) return;
+        setLoadingTrajs(true);
+        const fetches = entityIds.map(eid =>
+          apiFetch(`/api/entities/${videoName}/${eid}/trajectory`)
+            .then(data => ({ eid, data }))
+            .catch(() => ({ eid, data: null }))
+        );
+        Promise.all(fetches).then(results => {
+          const map = {};
+          results.forEach(r => {
+            if (r.data) map[r.eid] = r.data;
+          });
+          setTrajectories(map);
+          setLoadingTrajs(false);
+        });
+      }, [videoName, entityIds]);
+
+      // 构建图表数据
+      const chartData = useMemo(() => {
+        const displayEids = selectedEntity != null ? [selectedEntity] : entityIds;
+        const allPoints = [];
+
+        displayEids.forEach(eid => {
+          const traj = trajectories[eid];
+          if (!traj) return;
+          (traj.trajectory || []).forEach(p => {
+            allPoints.push({
+              timestamp: p.timestamp,
+              [`E${eid}`]: p.kinetic_energy,
+            });
+          });
+        });
+
+        // 按时间排序合并
+        allPoints.sort((a, b) => a.timestamp - b.timestamp);
+
+        // 合并相同时间戳的数据
+        const merged = [];
+        let current = null;
+        allPoints.forEach(p => {
+          if (!current || Math.abs(current.timestamp - p.timestamp) > 0.01) {
+            if (current) merged.push(current);
+            current = { ...p };
+          } else {
+            Object.assign(current, p);
+          }
+        });
+        if (current) merged.push(current);
+
+        return merged;
+      }, [trajectories, selectedEntity, entityIds]);
+
+      const anomalyAreas = useMemo(() => {
+        if (!narrative?.narratives) return [];
+        return narrative.narratives
+          .filter(n => n.is_anomaly && n.anomaly_start_sec > 0)
+          .map(n => ({
+            x1: n.anomaly_start_sec,
+            x2: n.anomaly_end_sec,
+            entity_id: n.entity_id,
+          }));
+      }, [narrative]);
+
+      const displayEids = selectedEntity != null ? [selectedEntity] : entityIds;
+      const lineColors = ['#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#a855f7', '#06b6d4', '#f43f5e', '#84cc16'];
+
+      return (
+        <div className="fade-in">
+          <h2 className="text-sm font-semibold text-gray-300 mb-2 flex items-center gap-2">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+            动能分析
+            {loadingTrajs && <span className="text-gray-500 text-xs ml-2">加载中...</span>}
+          </h2>
+
+          {chartData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={chartData} onClick={(e) => {
+                if (e?.activePayload?.[0]?.payload?.timestamp != null) {
+                  onSeek(e.activePayload[0].payload.timestamp);
+                }
+              }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                <XAxis
+                  dataKey="timestamp"
+                  stroke="#64748b"
+                  tick={{ fontSize: 10 }}
+                  tickFormatter={v => `${v.toFixed(0)}s`}
+                />
+                <YAxis stroke="#64748b" tick={{ fontSize: 10 }} />
+                <Tooltip
+                  contentStyle={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8, fontSize: 12 }}
+                  labelStyle={{ color: '#94a3b8' }}
+                  labelFormatter={v => `T=${Number(v).toFixed(1)}s`}
+                />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+
+                {/* 异常区间标记 */}
+                {anomalyAreas.map((area, i) => (
+                  <ReferenceArea
+                    key={i}
+                    x1={area.x1}
+                    x2={area.x2}
+                    fill="#ef4444"
+                    fillOpacity={0.1}
+                    stroke="#ef4444"
+                    strokeOpacity={0.3}
+                  />
+                ))}
+
+                {/* 当前时间线 */}
+                <ReferenceLine x={currentTime} stroke="#3b82f6" strokeDasharray="4 4" strokeWidth={1.5} />
+
+                {/* 实体动能线 */}
+                {displayEids.map((eid, i) => (
+                  <Line
+                    key={eid}
+                    type="monotone"
+                    dataKey={`E${eid}`}
+                    stroke={lineColors[i % lineColors.length]}
+                    strokeWidth={1.5}
+                    dot={false}
+                    connectNulls
+                    name={`Entity #${eid}`}
+                  />
+                ))}
+              </LineChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="h-[220px] flex items-center justify-center text-gray-500 text-sm">
+              {loadingTrajs ? '加载轨迹数据...' : '无轨迹数据'}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ══════════════════════════════════════════════════════
+    // D. 审计叙事面板
+    // ══════════════════════════════════════════════════════
+    function AuditPanel({ narrative, selectedEntity, onSeek, onEntitySelect }) {
+      if (!narrative) return null;
+
+      return (
+        <div className="fade-in">
+          <h2 className="text-sm font-semibold text-gray-300 mb-3 flex items-center gap-2">
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+            审计结论
+          </h2>
+
+          {/* 全局摘要 */}
+          <div className={`p-3 rounded-lg mb-3 text-sm ${narrative.is_anomaly ? 'bg-red-900/20 border border-red-800/40' : 'bg-green-900/20 border border-green-800/40'}`}>
+            <div className="flex items-center gap-2 mb-1.5">
+              <span className={`text-xs font-semibold px-2 py-0.5 rounded ${narrative.is_anomaly ? 'bg-red-800 text-red-200' : 'bg-green-800 text-green-200'}`}>
+                {narrative.is_anomaly ? '异常检出' : '正常'}
+              </span>
+              <span className="text-xs text-gray-400">场景: {narrative.scene_type}</span>
+            </div>
+            <p className="text-gray-300 text-xs leading-relaxed whitespace-pre-wrap">
+              {narrative.summary}
+            </p>
+          </div>
+
+          {/* 实体叙事列表 */}
+          <div className="space-y-2">
+            {(narrative.narratives || [])
+              .filter(n => selectedEntity == null || n.entity_id === selectedEntity)
+              .sort((a, b) => (b.is_anomaly ? 1 : 0) - (a.is_anomaly ? 1 : 0))
+              .map(n => (
+                <NarrativeCard
+                  key={n.entity_id}
+                  narrative={n}
+                  isSelected={selectedEntity === n.entity_id}
+                  onSeek={onSeek}
+                  onSelect={() => onEntitySelect(n.entity_id)}
+                />
+              ))
+            }
+          </div>
+        </div>
+      );
+    }
+
+    function NarrativeCard({ narrative: n, isSelected, onSeek, onSelect }) {
+      const [expanded, setExpanded] = useState(false);
+
+      return (
+        <div
+          className={`rounded-lg border transition-all cursor-pointer ${
+            isSelected
+              ? 'bg-surface-1 border-brand-500'
+              : n.is_anomaly
+                ? 'bg-surface-1 border-red-800/40 hover:border-red-700'
+                : 'bg-surface-1 border-surface-2 hover:border-surface-3'
+          }`}
+          onClick={onSelect}
+        >
+          <div className="p-3">
+            <div className="flex items-center justify-between mb-1.5">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold text-gray-200">Entity #{n.entity_id}</span>
+                {n.is_anomaly && (
+                  <span className="text-xs px-1.5 py-0.5 bg-red-900/50 text-red-400 rounded flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 bg-red-500 rounded-full pulse-warn" />
+                    异常
+                  </span>
+                )}
+              </div>
+              <span className="text-xs text-gray-500">
+                {n.total_duration?.toFixed(1)}s | 危险度 {n.max_danger_score?.toFixed(2)}
+              </span>
+            </div>
+
+            {n.reason && (
+              <p className="text-xs text-gray-400 leading-relaxed mb-2">{n.reason}</p>
+            )}
+
+            {n.is_anomaly && n.anomaly_start_sec > 0 && (
+              <button
+                onClick={(e) => { e.stopPropagation(); onSeek(n.anomaly_start_sec); }}
+                className="text-xs text-brand-500 hover:text-brand-400 underline"
+              >
+                跳转至异常区间 [{formatTime(n.anomaly_start_sec)} - {formatTime(n.anomaly_end_sec)}]
+              </button>
+            )}
+
+            <button
+              onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+              className="text-xs text-gray-500 hover:text-gray-300 mt-2 block"
+            >
+              {expanded ? '收起详情 ▲' : '展开详情 ▼'}
+            </button>
+          </div>
+
+          {expanded && (
+            <div className="px-3 pb-3 border-t border-surface-2 pt-2">
+              <h4 className="text-xs font-semibold text-gray-400 mb-1.5">动作序列</h4>
+              <div className="space-y-1">
+                {(n.action_sequence || []).map((act, i) => (
+                  <div key={i} className="flex items-center gap-2 text-xs">
+                    <button
+                      onClick={(e) => { e.stopPropagation(); onSeek(act.timestamp); }}
+                      className="text-brand-500 hover:text-brand-400 font-mono min-w-[50px]"
+                    >
+                      {act.timestamp?.toFixed(1)}s
+                    </button>
+                    <span className={`w-2 h-2 rounded-full ${TRIGGER_COLORS[act.trigger_rule]?.bg || 'bg-gray-500'}`} />
+                    <span className="text-gray-300">{act.action}</span>
+                    {act.is_suspicious && <span className="text-red-400">⚠</span>}
+                    <span className="text-gray-500 ml-auto">KE={act.kinetic_energy?.toFixed(4)}</span>
+                  </div>
+                ))}
+              </div>
+
+              {(n.transitions || []).length > 0 && (
+                <>
+                  <h4 className="text-xs font-semibold text-gray-400 mt-3 mb-1.5">状态转移</h4>
+                  <div className="space-y-1">
+                    {n.transitions.map((tr, i) => (
+                      <div key={i} className="text-xs text-gray-400">
+                        {tr.action_transition} ({tr.duration_sec?.toFixed(1)}s, ΔKE={tr.kinetic_integral?.toFixed(4)})
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── 渲染 ──
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>

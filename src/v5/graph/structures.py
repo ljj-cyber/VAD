@@ -34,6 +34,7 @@ class TemporalNode:
     scene_context: str = "unknown"
     is_suspicious: bool = False
     danger_score: float = 0.0
+    anomaly_category_guess: str = "none"
 
     # 触发规则
     trigger_rule: str = ""               # "birth" / "change_point" / "heartbeat"

@@ -1,13 +1,18 @@
 """
-V5 Tube-Skeleton Pipeline — UCF-Crime 评估脚本
+V5 Tube-Skeleton Pipeline — XD-Violence 评估脚本
 
 评估指标:
   1. Frame-level AUC-ROC (核心)
-  2. Video-level Accuracy / Precision / Recall / F1
-  3. Mean Anomaly Segment IoU
+  2. Frame-level AP (Average Precision)
+  3. Video-level Accuracy / Precision / Recall / F1
+
+标注格式 (annotations.txt):
+  每行: video_name frame_start frame_end [frame_start frame_end ...]
+  - 帧号成对出现，表示异常区间
+  - label_A 视频为正常视频（不在标注文件中）
 
 用法:
-  python -m v5.eval_ucf_crime --max-videos 20 --sample-every 2 --parallel 3
+  python -m v5.eval_xd_violence --max-videos 50 --sample-every 2 --parallel 3
 """
 
 import argparse
@@ -19,13 +24,13 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 
-# ── 日志（以时间戳命名，避免覆盖） ──
-_log_base = "/data/liuzhe/EventVAD/output/v5/eval_ucf_crime"
+# ── 日志 ──
+_log_base = "/data/liuzhe/EventVAD/output/v5/eval_xd_violence"
 _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 _log_dir = f"{_log_base}/run_{_run_ts}"
 os.makedirs(_log_dir, exist_ok=True)
@@ -49,82 +54,104 @@ from v5.config import OUTPUT_DIR
 
 
 # ── 数据加载 ──────────────────────────────────────────
-UCF_ROOT = Path("/data/liuzhe/EventVAD/src/event_seg/videos/ucf_crime")
-ANN_FILE = UCF_ROOT / "Temporal_Anomaly_Annotation_for_Testing_Videos.txt"
-SEARCH_DIRS = [
-    "Anomaly-Videos-Part-1", "Anomaly-Videos-Part-2",
-    "Anomaly-Videos-Part-3", "Anomaly-Videos-Part-4",
-    "Testing_Normal_Videos_Anomaly",
-]
+XD_ROOT = Path("/data/liuzhe/EventVAD/src/event_seg/videos/xdviolence")
+XD_VIDEOS = XD_ROOT / "videos"
+ANN_FILE = Path("/data/liuzhe/EventVAD/src/event_seg/videos/annotations.txt")
 
 
 @dataclass
 class VideoAnnotation:
-    filename: str
-    category: str
+    filename: str          # e.g., "v=S-7rRLrxnVQ__#1_label_B4-0-0"
+    label: str             # e.g., "B4-0-0", "A" (normal)
     is_anomaly: bool
-    intervals: list  # [(start_frame, end_frame), ...]
+    intervals: list = field(default_factory=list)  # [(start_frame, end_frame), ...]
     filepath: str = ""
     total_frames: int = 0
 
 
+def _extract_label(filename: str) -> str:
+    """从文件名中提取标签，如 _label_B4-0-0 -> B4-0-0"""
+    idx = filename.find("_label_")
+    if idx >= 0:
+        return filename[idx + 7:]
+    return "unknown"
+
+
+def _extract_primary_category(label: str) -> str:
+    """提取主类别，如 B4-0-0 -> B4, G-B2-0 -> G, B1-B2-B6 -> B1"""
+    parts = label.split("-")
+    return parts[0] if parts else label
+
+
 def load_annotations() -> list[VideoAnnotation]:
+    """加载 XD-Violence 测试集标注"""
+    # 构建视频文件索引
     file_index = {}
-    for d in SEARCH_DIRS:
-        base = UCF_ROOT / d
-        if not base.exists():
-            continue
-        for root, _, files in os.walk(base):
-            for f in files:
-                if f.endswith(".mp4"):
-                    file_index[f] = os.path.join(root, f)
+    if XD_VIDEOS.exists():
+        for f in XD_VIDEOS.iterdir():
+            if f.suffix == ".mp4":
+                stem = f.stem  # 不含 .mp4
+                file_index[stem] = str(f)
 
     annotations = []
+    ann_names = set()
+
+    # 1. 加载异常视频标注
     with open(ANN_FILE) as fp:
         for line in fp:
-            parts = line.strip().split()
-            if len(parts) < 6:
+            line = line.strip()
+            if not line:
                 continue
-            fname, category = parts[0], parts[1]
-            s1, e1, s2, e2 = int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
 
+            parts = line.split()
+            video_name = parts[0]
+            # 去掉可能的 .mp4 后缀
+            video_name_clean = video_name.replace(".mp4", "")
+            frame_numbers = [int(x) for x in parts[1:]]
+
+            # 解析帧号对
             intervals = []
-            if s1 != -1 and e1 != -1:
-                intervals.append((s1, e1))
-            if s2 != -1 and e2 != -1:
-                intervals.append((s2, e2))
+            for i in range(0, len(frame_numbers), 2):
+                if i + 1 < len(frame_numbers):
+                    s, e = frame_numbers[i], frame_numbers[i + 1]
+                    if s < e:
+                        intervals.append((s, e))
+
+            label = _extract_label(video_name_clean)
+            filepath = file_index.get(video_name_clean, "")
 
             annotations.append(VideoAnnotation(
-                filename=fname,
-                category=category,
-                is_anomaly=category != "Normal",
+                filename=video_name_clean,
+                label=label,
+                is_anomaly=True,
                 intervals=intervals,
-                filepath=file_index.get(fname, ""),
+                filepath=filepath,
+            ))
+            ann_names.add(video_name_clean)
+
+    # 2. 加载正常视频（label_A，不在标注文件中）
+    for stem, fpath in file_index.items():
+        if stem not in ann_names and "_label_A" in stem:
+            annotations.append(VideoAnnotation(
+                filename=stem,
+                label="A",
+                is_anomaly=False,
+                intervals=[],
+                filepath=fpath,
             ))
 
+    n_anomaly = sum(1 for a in annotations if a.is_anomaly)
+    n_normal = sum(1 for a in annotations if not a.is_anomaly)
+    n_found = sum(1 for a in annotations if a.filepath)
     logger.info(
-        f"Loaded {len(annotations)} annotations "
-        f"({sum(a.is_anomaly for a in annotations)} anomaly, "
-        f"{sum(not a.is_anomaly for a in annotations)} normal)"
+        f"Loaded {len(annotations)} annotations: "
+        f"{n_anomaly} anomaly + {n_normal} normal, "
+        f"{n_found} files found"
     )
     return annotations
 
 
-# ── 帧级分数 ──────────────────────────────────────────
-def _parse_time(time_str) -> float:
-    if isinstance(time_str, (int, float)):
-        return float(time_str)
-    time_str = str(time_str).strip()
-    if ":" in time_str:
-        parts = time_str.split(":")
-        if len(parts) == 2:
-            return float(parts[0]) * 60 + float(parts[1])
-    try:
-        return float(time_str)
-    except ValueError:
-        return 0.0
-
-
+# ── 帧级分数 (复用 eval_ucf_crime 中的逻辑) ──────────
 def build_gt_mask(intervals: list, total_frames: int) -> np.ndarray:
     mask = np.zeros(total_frames, dtype=bool)
     for s, e in intervals:
@@ -138,12 +165,7 @@ def compute_frame_scores(
     total_frames: int,
     fps: float,
 ) -> np.ndarray:
-    """
-    帧级异常分数生成器 — 纯 Signal 1。
-
-    Signal 1: Decision LLM 输出的 anomaly_start_sec / anomaly_end_sec 区间，
-              直接广播 confidence 值，前后加 ramp 渐变，最后高斯平滑。
-    """
+    """帧级异常分数：基于 entity verdict 的时间区间广播 + 高斯平滑"""
     try:
         from scipy.ndimage import gaussian_filter1d
         _has_scipy = True
@@ -152,8 +174,8 @@ def compute_frame_scores(
 
     scores = np.zeros(total_frames, dtype=np.float32)
     ramp_sec = 5.0
-
     any_entity_anomaly = False
+
     for v in entity_verdicts:
         if not v.get("is_anomaly", False):
             continue
@@ -186,90 +208,16 @@ def compute_frame_scores(
             ramp_values = np.linspace(conf * 0.8, conf * 0.1, n, dtype=np.float32)
             scores[core_ef:ramp_ef] = np.maximum(scores[core_ef:ramp_ef], ramp_values)
 
-    # 高斯平滑 (σ = 2秒)
+    # 高斯平滑
     if total_frames > 10 and _has_scipy:
         smooth_sigma = max(1, int(2.0 * fps))
         scores = gaussian_filter1d(scores, sigma=smooth_sigma).astype(np.float32)
 
-    # 如果视频判异常但所有信号都为0，给全视频低底分
+    # 视频判异常但帧分数全 0 → 给低底分
     if any_entity_anomaly and scores.max() < 0.01:
         scores[:] = video_confidence * 0.2
 
-    # 裁剪到 [0, 1]
-    scores = np.clip(scores, 0.0, 1.0)
-
-    return scores
-
-
-def _hysteresis_threshold(
-    scores: np.ndarray,
-    tau_high: float = 0.35,
-    tau_low: float = 0.15,
-) -> np.ndarray:
-    """
-    滞回阈值：score >= tau_high 启动异常段，score < tau_low 结束。
-    桥接异常段中间的短暂 score 下降，减少碎片化。
-    """
-    mask = np.zeros(len(scores), dtype=bool)
-    in_segment = False
-    for i in range(len(scores)):
-        if not in_segment:
-            if scores[i] >= tau_high:
-                in_segment = True
-                mask[i] = True
-        else:
-            if scores[i] >= tau_low:
-                mask[i] = True
-            else:
-                in_segment = False
-    return mask
-
-
-def compute_frame_iou(
-    gt_intervals: list,
-    entity_verdicts: list[dict],
-    total_frames: int,
-    fps: float,
-    mode: str = "soft",
-    tau_high: float = 0.35,
-    tau_low: float = 0.15,
-) -> float:
-    """
-    帧级 IoU 计算（基于 compute_frame_scores 生成的连续分数）。
-
-    模式:
-      - "soft":       Soft IoU = Σmin(gt, pred) / Σmax(gt, pred)，无阈值
-      - "hysteresis": 滞回阈值二值化后计算 hard IoU
-    """
-    if total_frames <= 0:
-        return 0.0
-
-    gt_mask = build_gt_mask(gt_intervals, total_frames).astype(np.float32)
-
-    video_confidence = max(
-        (float(v.get("confidence", 0.0)) for v in entity_verdicts if v.get("is_anomaly")),
-        default=0.0,
-    )
-    scores = compute_frame_scores(
-        entity_verdicts, video_confidence,
-        total_frames, fps,
-    )
-
-    if mode == "soft":
-        # Soft IoU: 无阈值，信息保留最完整
-        numerator = np.minimum(gt_mask, scores).sum()
-        denominator = np.maximum(gt_mask, scores).sum()
-        if denominator < 1e-8:
-            return 1.0 if numerator < 1e-8 else 0.0
-        return float(numerator / denominator)
-
-    else:  # "hysteresis"
-        pred_mask = _hysteresis_threshold(scores, tau_high, tau_low)
-        inter = np.logical_and(gt_mask > 0.5, pred_mask).sum()
-        union = np.logical_or(gt_mask > 0.5, pred_mask).sum()
-        if union == 0:
-            return 1.0 if inter == 0 else 0.0
-        return float(inter) / float(union)
+    return np.clip(scores, 0.0, 1.0)
 
 
 # ── 评估主逻辑 ────────────────────────────────────────
@@ -284,45 +232,43 @@ def evaluate(
     backend: str = "server",
     disable_discordance: bool = False,
     use_yolo: bool = False,
+    cinematic_filter: bool = False,
 ) -> dict:
-    # 本地推理时强制串行（模型单线程）
     if backend == "local" and parallel_videos > 1:
         logger.info(f"Local backend: forcing parallel=1 (was {parallel_videos})")
         parallel_videos = 1
 
     if max_videos > 0:
         if balanced:
-            # 分层采样：每个异常类别至少 1 个视频，剩余按类别大小分配
             from collections import defaultdict
             anomaly = [a for a in annotations if a.is_anomaly]
             normal = [a for a in annotations if not a.is_anomaly]
             n_anomaly = max_videos // 2
             n_normal = max_videos - n_anomaly
 
-            # 按类别分组
+            # 按主类别分组
             cat_groups: dict[str, list] = defaultdict(list)
             for a in anomaly:
-                cat_groups[a.category].append(a)
+                cat = _extract_primary_category(a.label)
+                cat_groups[cat].append(a)
 
-            # 分层采样: 每个类别至少 1 个
             selected_anomaly = []
             remaining_slots = n_anomaly
             categories = sorted(cat_groups.keys())
 
-            # 第一轮: 每个类别选 1 个
             for cat in categories:
                 if remaining_slots <= 0:
                     break
                 selected_anomaly.append(cat_groups[cat][0])
                 remaining_slots -= 1
 
-            # 第二轮: 剩余名额按类别大小比例分配（从大类别再选）
             if remaining_slots > 0:
                 large_cats = sorted(categories, key=lambda c: len(cat_groups[c]), reverse=True)
                 idx = 0
                 while remaining_slots > 0 and idx < len(large_cats) * 10:
                     cat = large_cats[idx % len(large_cats)]
-                    picked = sum(1 for a in selected_anomaly if a.category == cat)
+                    picked = sum(1 for a in selected_anomaly
+                                 if _extract_primary_category(a.label) == cat)
                     if picked < len(cat_groups[cat]):
                         selected_anomaly.append(cat_groups[cat][picked])
                         remaining_slots -= 1
@@ -330,10 +276,9 @@ def evaluate(
 
             annotations = selected_anomaly + normal[:n_normal]
 
-            # 统计
             cat_counts = defaultdict(int)
             for a in selected_anomaly:
-                cat_counts[a.category] += 1
+                cat_counts[_extract_primary_category(a.label)] += 1
             cat_str = ", ".join(f"{c}={n}" for c, n in sorted(cat_counts.items()))
             logger.info(
                 f"Stratified sampling: {len(selected_anomaly)} anomaly [{cat_str}] "
@@ -343,24 +288,21 @@ def evaluate(
             annotations = annotations[:max_videos]
 
     total = len(annotations)
-    ablation_tag = " [ABLATION: no-discordance]" if disable_discordance else ""
-    yolo_tag = " [YOLO hybrid]" if use_yolo else ""
     logger.info(f"\n{'='*60}")
-    logger.info(f"  V5 Tube-Skeleton UCF-Crime Evaluation{ablation_tag}{yolo_tag}")
+    logger.info(f"  V5 Tube-Skeleton XD-Violence Evaluation")
     logger.info(f"  Videos: {total}, sample_every={sample_every}, parallel={parallel_videos}")
-    if disable_discordance:
-        logger.info(f"  ★ Discordance DISABLED — pure semantic anomaly detection")
+    logger.info(f"  cinematic_filter={cinematic_filter}")
     logger.info(f"{'='*60}\n")
 
     results = []
-    results_lock = threading.Lock()
     t_start = time.time()
 
     def _process_one(idx_ann):
         i, ann = idx_ann
         if not ann.filepath or not Path(ann.filepath).exists():
+            logger.warning(f"[{i+1}/{total}] SKIP {ann.filename}: file not found")
             return {
-                "filename": ann.filename, "category": ann.category,
+                "filename": ann.filename, "label": ann.label,
                 "gt_anomaly": ann.is_anomaly, "pred_anomaly": False,
                 "pred_score": 0.0, "error": "not found",
             }
@@ -371,6 +313,7 @@ def evaluate(
             backend=backend,
             disable_discordance=disable_discordance,
             use_yolo=use_yolo,
+            cinematic_filter=cinematic_filter,
         )
 
         try:
@@ -385,55 +328,40 @@ def evaluate(
             pred_anomaly = verdict.get("is_anomaly", False)
             pred_score = verdict.get("confidence", 0.0)
             entity_verdicts = verdict.get("entity_verdicts", [])
-
             total_frames = result.get("total_frames", 0)
             fps = result.get("fps", 30.0)
 
-            iou_soft = None
-            iou_hyst = None
-            if ann.is_anomaly and total_frames > 0:
-                iou_soft = compute_frame_iou(
-                    ann.intervals, entity_verdicts, total_frames, fps,
-                    mode="soft",
-                )
-                iou_hyst = compute_frame_iou(
-                    ann.intervals, entity_verdicts, total_frames, fps,
-                    mode="hysteresis",
-                )
-
+            is_cine = verdict.get("is_cinematic", False)
+            cine_tag = " [CINE]" if is_cine else ""
             status = "✅" if pred_anomaly == ann.is_anomaly else "❌"
-            iou_str = ""
-            if iou_soft is not None:
-                iou_str = f"SoftIoU={iou_soft:.3f} HystIoU={iou_hyst:.3f}"
             logger.info(
                 f"[{i+1}/{total}] {status} {ann.filename} "
                 f"GT={ann.is_anomaly} Pred={pred_anomaly} "
-                f"Score={pred_score:.2f} {iou_str} "
+                f"Score={pred_score:.2f} "
                 f"entities={result['stats']['entities']} "
                 f"triggers={result['stats']['triggers']} "
-                f"{elapsed:.1f}s"
+                f"{elapsed:.1f}s{cine_tag}"
             )
 
             return {
                 "filename": ann.filename,
-                "category": ann.category,
+                "label": ann.label,
                 "gt_anomaly": ann.is_anomaly,
                 "gt_intervals": ann.intervals,
                 "pred_anomaly": pred_anomaly,
                 "pred_score": pred_score,
                 "entity_verdicts": entity_verdicts,
-                "iou": iou_soft,
-                "iou_soft": iou_soft,
-                "iou_hysteresis": iou_hyst,
                 "fps": fps,
                 "total_frames": total_frames,
                 "time_sec": round(elapsed, 1),
                 "stats": result.get("stats", {}),
+                "is_cinematic": is_cine,
+                "cinematic_reason": verdict.get("cinematic_reason", ""),
             }
         except Exception as e:
             logger.error(f"[{i+1}/{total}] ❌ {ann.filename}: {e}")
             return {
-                "filename": ann.filename, "category": ann.category,
+                "filename": ann.filename, "label": ann.label,
                 "gt_anomaly": ann.is_anomaly, "pred_anomaly": False,
                 "pred_score": 0.0, "error": str(e),
             }
@@ -457,31 +385,26 @@ def evaluate(
     metrics["max_videos"] = max_videos
     metrics["run_timestamp"] = _run_ts
     metrics["run_dir"] = str(_log_dir)
-    metrics["disable_discordance"] = disable_discordance
-    metrics["use_yolo"] = use_yolo
 
     # ── 打印 ──
     print_metrics(metrics)
 
     # ── 保存 ──
     out_dir = Path(_log_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    results_path = out_dir / "results_v5.json"
+    results_path = out_dir / "results_xd_violence.json"
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump({"metrics": metrics, "details": results}, f, indent=2, ensure_ascii=False)
 
-    # 创建/更新 latest 软链接，方便快速查看最新结果
+    # latest symlink
     latest_link = Path(_log_base) / "latest"
     try:
         if latest_link.is_symlink() or latest_link.exists():
             latest_link.unlink()
         latest_link.symlink_to(out_dir)
     except OSError:
-        pass  # 软链接创建失败不影响主流程
+        pass
 
     logger.info(f"\nResults saved to {results_path}")
-    logger.info(f"Run directory: {out_dir}")
     return metrics
 
 
@@ -489,6 +412,7 @@ def compute_metrics(results: list[dict]) -> dict:
     if not results:
         return {}
 
+    # Video-level metrics
     correct = sum(1 for r in results if r.get("pred_anomaly") == r.get("gt_anomaly"))
     total = len(results)
     accuracy = correct / total
@@ -502,10 +426,11 @@ def compute_metrics(results: list[dict]) -> dict:
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-    # Frame-level AUC-ROC
+    # Frame-level AUC-ROC & AP
     frame_auc = 0.0
+    frame_ap = 0.0
     try:
-        from sklearn.metrics import roc_auc_score
+        from sklearn.metrics import roc_auc_score, average_precision_score
         all_gt, all_pred = [], []
         for r in results:
             tf = r.get("total_frames", 0)
@@ -523,8 +448,13 @@ def compute_metrics(results: list[dict]) -> dict:
 
         if len(set(all_gt)) > 1:
             frame_auc = roc_auc_score(all_gt, all_pred)
+            frame_ap = average_precision_score(all_gt, all_pred)
+        logger.info(
+            f"Frame-level stats: {len(all_gt)} total frames, "
+            f"{sum(all_gt)} anomaly frames ({100*sum(all_gt)/max(len(all_gt),1):.1f}%)"
+        )
     except Exception as e:
-        logger.warning(f"Frame AUC computation failed: {e}")
+        logger.warning(f"Frame-level metric computation failed: {e}")
 
     # Video-level AUC
     video_auc = 0.0
@@ -537,35 +467,23 @@ def compute_metrics(results: list[dict]) -> dict:
     except Exception:
         pass
 
-    # IoU (Soft + Hysteresis)
-    ious_soft = [r["iou_soft"] for r in results
-                 if r.get("iou_soft") is not None and r["iou_soft"] > 0]
-    ious_hyst = [r["iou_hysteresis"] for r in results
-                 if r.get("iou_hysteresis") is not None and r["iou_hysteresis"] > 0]
-    mean_iou_soft = float(np.mean(ious_soft)) if ious_soft else 0.0
-    mean_iou_hyst = float(np.mean(ious_hyst)) if ious_hyst else 0.0
-
-    # Per category
-    cat_stats = {}
+    # Per-category stats
+    from collections import defaultdict
+    cat_stats = defaultdict(lambda: {"total": 0, "correct": 0, "tp": 0, "fn": 0, "fp": 0})
     for r in results:
-        cat = r.get("category", "Unknown")
-        if cat not in cat_stats:
-            cat_stats[cat] = {"total": 0, "correct": 0,
-                              "ious_soft": [], "ious_hyst": []}
+        cat = _extract_primary_category(r.get("label", "unknown"))
         cat_stats[cat]["total"] += 1
         if r.get("pred_anomaly") == r.get("gt_anomaly"):
             cat_stats[cat]["correct"] += 1
-        if r.get("iou_soft") is not None:
-            cat_stats[cat]["ious_soft"].append(r["iou_soft"])
-        if r.get("iou_hysteresis") is not None:
-            cat_stats[cat]["ious_hyst"].append(r["iou_hysteresis"])
+        if r.get("gt_anomaly") and r.get("pred_anomaly"):
+            cat_stats[cat]["tp"] += 1
+        if r.get("gt_anomaly") and not r.get("pred_anomaly"):
+            cat_stats[cat]["fn"] += 1
+        if not r.get("gt_anomaly") and r.get("pred_anomaly"):
+            cat_stats[cat]["fp"] += 1
 
     for cat, s in cat_stats.items():
         s["accuracy"] = round(s["correct"] / s["total"], 4) if s["total"] > 0 else 0
-        s["mean_iou_soft"] = round(float(np.mean(s["ious_soft"])), 4) if s["ious_soft"] else 0.0
-        s["mean_iou_hyst"] = round(float(np.mean(s["ious_hyst"])), 4) if s["ious_hyst"] else 0.0
-        del s["ious_soft"]
-        del s["ious_hyst"]
 
     return {
         "accuracy": round(accuracy, 4),
@@ -573,57 +491,56 @@ def compute_metrics(results: list[dict]) -> dict:
         "recall": round(recall, 4),
         "f1": round(f1, 4),
         "frame_auc": round(frame_auc, 4),
+        "frame_ap": round(frame_ap, 4),
         "video_auc": round(video_auc, 4),
-        "mean_iou": round(mean_iou_soft, 4),
-        "mean_iou_soft": round(mean_iou_soft, 4),
-        "mean_iou_hysteresis": round(mean_iou_hyst, 4),
         "tp": tp, "fn": fn, "fp": fp, "tn": tn,
         "total": total,
-        "category_stats": cat_stats,
+        "category_stats": dict(cat_stats),
     }
 
 
 def print_metrics(metrics: dict):
     print(f"\n{'='*70}")
-    print(f"  V5 Tube-Skeleton — UCF-Crime Evaluation Results")
+    print(f"  V5 Tube-Skeleton — XD-Violence Evaluation Results")
     print(f"{'='*70}")
     print(f"  Video-level Accuracy:  {metrics['accuracy']:.4f} ({metrics['tp']+metrics['tn']}/{metrics['total']})")
     print(f"  Precision:             {metrics['precision']:.4f}")
     print(f"  Recall:                {metrics['recall']:.4f}")
     print(f"  F1 Score:              {metrics['f1']:.4f}")
     print(f"  ★ Frame-level AUC-ROC: {metrics.get('frame_auc', 0):.4f}")
+    print(f"  ★ Frame-level AP:      {metrics.get('frame_ap', 0):.4f}")
     print(f"  Video-level AUC-ROC:   {metrics.get('video_auc', 0):.4f}")
-    print(f"  Mean Soft IoU:         {metrics.get('mean_iou_soft', 0):.4f}")
-    print(f"  Mean Hysteresis IoU:   {metrics.get('mean_iou_hysteresis', 0):.4f}")
     print(f"  TP={metrics['tp']}  FN={metrics['fn']}  FP={metrics['fp']}  TN={metrics['tn']}")
     print(f"  Total time: {metrics.get('total_time_sec', 0)}s "
           f"({metrics.get('avg_time_per_video', 0)}s/video)")
     print(f"\n  Per-category:")
     for cat, s in sorted(metrics.get("category_stats", {}).items()):
-        iou_s = f"SoftIoU={s['mean_iou_soft']:.3f}" if s.get("mean_iou_soft") else ""
-        iou_h = f"HystIoU={s['mean_iou_hyst']:.3f}" if s.get("mean_iou_hyst") else ""
-        print(f"    {cat:<20} acc={s['accuracy']:.2f} ({s['correct']}/{s['total']}) {iou_s} {iou_h}")
+        print(f"    {cat:<12} acc={s['accuracy']:.2f} "
+              f"({s['correct']}/{s['total']}) "
+              f"TP={s['tp']} FN={s['fn']} FP={s['fp']}")
     print(f"{'='*70}\n")
 
 
 # ── CLI ───────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="V5 UCF-Crime Evaluation")
-    parser.add_argument("--max-videos", type=int, default=20)
-    parser.add_argument("--sample-every", type=int, default=2,
-                        help="Process every N-th frame (default 2)")
+    parser = argparse.ArgumentParser(description="V5 XD-Violence Evaluation")
+    parser.add_argument("--max-videos", type=int, default=0,
+                        help="Max videos to evaluate (0=all 800)")
+    parser.add_argument("--sample-every", type=int, default=3,
+                        help="Process every N-th frame (default 3, ★ 2→3 for speed)")
     parser.add_argument("--api-base", default="http://localhost:8000")
     parser.add_argument("--max-workers", type=int, default=48)
     parser.add_argument("--parallel", type=int, default=6,
                         help="Parallel video processing count")
-    parser.add_argument("--backend", default="server", choices=["server", "local"],
-                        help="Inference backend: server (vLLM API) or local (transformers)")
+    parser.add_argument("--backend", default="server", choices=["server", "local"])
     parser.add_argument("--no-balanced", action="store_true",
                         help="Disable balanced anomaly/normal sampling")
     parser.add_argument("--no-discordance", action="store_true",
-                        help="Disable discordance checker (ablation: pure semantic)")
+                        help="Disable discordance checker")
     parser.add_argument("--yolo", action="store_true",
-                        help="Enable YOLO-World hybrid detection (motion + semantic)")
+                        help="Enable YOLO-World hybrid detection")
+    parser.add_argument("--cinematic-filter", action="store_true",
+                        help="Enable cinematic/movie scene filter to reduce FP on film clips")
     args = parser.parse_args()
 
     annotations = load_annotations()
@@ -638,6 +555,7 @@ def main():
         backend=args.backend,
         disable_discordance=args.no_discordance,
         use_yolo=args.yolo,
+        cinematic_filter=args.cinematic_filter,
     )
 
 

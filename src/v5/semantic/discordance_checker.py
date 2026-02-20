@@ -54,21 +54,21 @@ class DiscordanceChecker:
     def __init__(
         self,
         sigma_multiplier: float = 5.0,
-        min_energy_threshold: float = 0.15,
+        min_energy_threshold: float = 0.20,
         danger_ceiling: float = 0.10,
         drift_threshold: float = 0.20,
-        min_excess_ratio: float = 2.5,
-        voting_suppress_ratio: float = 0.5,
+        min_excess_ratio: float = 3.5,
+        voting_suppress_ratio: float = 0.35,
     ):
         """
         Args:
             sigma_multiplier: 背景动能 μ + k·σ 中的 k (从 3→5)
-            min_energy_threshold: 动能阈值的最小值 (从 0.05→0.15)
+            min_energy_threshold: 动能阈值的最小值 (★ 0.15→0.20, 高清视频动能基线更高)
             danger_ceiling: 当 VLLM danger_score < 此值时才算"语义保守"
             drift_threshold: CLIP 漂移阈值
-            min_excess_ratio: 动能/阈值 的最小倍率 (新增, ≥2.5x)
+            min_excess_ratio: 动能/阈值 的最小倍率 (★ 2.5→3.5, 更严格的超标要求)
             voting_suppress_ratio: 超标实体占活跃实体的比例超此值时
-                                   视为正常场景活跃，抑制 discordance (新增, 0.5=50%)
+                                   视为正常场景活跃，抑制 discordance (★ 0.5→0.35, 更积极抑制)
         """
         self.sigma_multiplier = sigma_multiplier
         self.min_energy_threshold = min_energy_threshold
