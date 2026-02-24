@@ -297,9 +297,7 @@ class SemanticVLLM:
         """通过 vLLM server API 并行推理"""
         import httpx
 
-        model_name = self.cfg.MODEL_PATHS.get(
-            self.cfg.model_name, self.cfg.model_name
-        )
+        model_name = self.cfg.model_name
         results = [None] * len(triggers)
 
         client = httpx.Client(timeout=90.0)
@@ -500,24 +498,67 @@ class SemanticVLLM:
         return results
 
     def _parse_response(self, raw_text: str) -> dict:
-        """解析 VLLM JSON 响应"""
+        """解析 VLLM JSON 响应（兼容 ```json 代码块和截断输出）"""
         import re
+
+        text = raw_text.strip()
+
+        # 去除 ```json ... ``` 包裹
+        md_match = re.search(r'```(?:json)?\s*(\{.*)', text, re.DOTALL)
+        if md_match:
+            text = md_match.group(1)
+            # 去除尾部 ```
+            text = re.sub(r'```\s*$', '', text).strip()
 
         # 尝试直接解析
         try:
-            data = json.loads(raw_text)
+            data = json.loads(text)
             return self._sanitize(data)
         except json.JSONDecodeError:
             pass
 
-        # 查找 JSON 块
-        match = re.search(r'\{[^{}]*\}', raw_text, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group())
-                return self._sanitize(data)
-            except json.JSONDecodeError:
-                pass
+        # 查找最外层 JSON 对象（支持嵌套大括号）
+        brace_start = text.find('{')
+        if brace_start >= 0:
+            depth = 0
+            for i in range(brace_start, len(text)):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            data = json.loads(text[brace_start:i+1])
+                            return self._sanitize(data)
+                        except json.JSONDecodeError:
+                            break
+
+            # JSON 被截断——尝试修补：补齐缺失的引号和大括号
+            truncated = text[brace_start:]
+            truncated = re.sub(r',\s*$', '', truncated)  # 去尾逗号
+            # 计算缺失的 } 数量
+            open_braces = truncated.count('{') - truncated.count('}')
+            if open_braces > 0:
+                # 如果在字符串值中间截断，先补引号
+                in_string = False
+                escaped = False
+                for ch in truncated:
+                    if escaped:
+                        escaped = False
+                        continue
+                    if ch == '\\':
+                        escaped = True
+                        continue
+                    if ch == '"':
+                        in_string = not in_string
+                if in_string:
+                    truncated += '"'
+                truncated += '}' * open_braces
+                try:
+                    data = json.loads(truncated)
+                    return self._sanitize(data)
+                except json.JSONDecodeError:
+                    pass
 
         logger.warning(f"Failed to parse semantic response: {raw_text[:200]}")
         return self._default_semantic()

@@ -74,6 +74,7 @@ class TubeSkeletonPipeline:
         api_base: str = "http://localhost:8000",
         max_workers: int = 16,
         backend: str = "server",
+        model_name: str = "",
         disable_discordance: bool = False,
         use_yolo: bool = False,
         cinematic_filter: bool = False,
@@ -83,8 +84,6 @@ class TubeSkeletonPipeline:
         self.cinematic_filter = cinematic_filter
 
         # Stage 1 — 始终使用 HybridDetector (帧差 + YOLO 融合)
-        #   use_yolo=False → lazy_yolo=True  (帧差优先, YOLO 按需 fallback)
-        #   use_yolo=True  → lazy_yolo=False (帧差 + YOLO 全程并行)
         hybrid_cfg = HybridDetectorConfig()
         hybrid_cfg.lazy_yolo = not use_yolo
         if use_yolo:
@@ -104,8 +103,7 @@ class TubeSkeletonPipeline:
         self.clip_encoder = CropCLIPEncoder(CLIPEncoderConfig())
         self.entity_tracker = EntityTracker(TrackerConfig())
         self.visual_painter = VisualPainter(output_size=(768, 768))
-        # ★ 增大 stacker 间隔以减少内存占用 (6→10)
-        self.frame_stacker = MultiFrameStacker(buffer_interval_frames=10, grid_size=(768, 768))
+        self.frame_stacker = MultiFrameStacker(buffer_interval_frames=8, grid_size=(768, 768))
 
         # Stage 2
         self.node_trigger = NodeTrigger(NodeTriggerConfig())
@@ -113,6 +111,9 @@ class TubeSkeletonPipeline:
         vllm_cfg.backend = backend
         vllm_cfg.api_base = api_base
         vllm_cfg.max_workers = max_workers
+        if model_name:
+            vllm_cfg.model_name = model_name
+        logger.info(f"VLM model: {vllm_cfg.model_name} (backend={backend})")
         self.semantic_vllm = SemanticVLLM(vllm_cfg)
         if not disable_discordance:
             self.discordance_checker = DiscordanceChecker(
@@ -538,6 +539,7 @@ def main():
     parser.add_argument("--video", required=True, help="Video file path")
     parser.add_argument("--api-base", default="http://localhost:8000", help="vLLM API base URL")
     parser.add_argument("--backend", default="server", choices=["server", "local"])
+    parser.add_argument("--model", default="", help="VLM model name (e.g. qwen2.5-vl-32b)")
     parser.add_argument("--max-workers", type=int, default=48)
     parser.add_argument("--sample-every", type=int, default=2, help="Process every N-th frame")
     parser.add_argument("--max-frames", type=int, default=0, help="Max frames to process (0=all)")
@@ -560,6 +562,7 @@ def main():
         api_base=args.api_base,
         max_workers=args.max_workers,
         backend=args.backend,
+        model_name=args.model,
         disable_discordance=args.no_discordance,
         use_yolo=args.yolo,
         cinematic_filter=args.cinematic_filter,

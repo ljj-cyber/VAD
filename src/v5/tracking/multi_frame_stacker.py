@@ -1,20 +1,21 @@
 """
-Multi-Frame Stacking — 4 宫格拼图生成器
+Multi-Frame Stacking — 聚光灯视频管 (Spotlight Tube) 拼图生成器
 
-解决单帧无法识别的异常（如推搡、连续虐待）：
-  当 Entity 处于活跃状态时，生成 2×2 拼图：
-  [T-6] [T-4]
-  [T-2] [T-0]
+构建以触发实体为焦点的时空降采样视频流:
+  1. 向历史回溯 τ 秒（默认 τ=3.0s）
+  2. 将该时间窗内的视频帧降采样至 4 fps
+  3. 从降采样帧中选取 4 帧生成 2×2 拼图
 
-  VLLM 能看到时序上的动作变化（"连环画"效果）。
+  VLLM 能看到时序上的动作变化（"连环画"效果）:
+  [T-τ]  [T-2/3τ]
+  [T-1/3τ] [T-0]
 
 用法:
-    stacker = MultiFrameStacker(buffer_interval=2, buffer_count=4)
+    stacker = MultiFrameStacker(lookback_sec=3.0, target_fps=4.0)
     for frame_idx, frame in video:
-        stacker.push(frame_idx, timestamp, frame)
+        stacker.push(frame_idx, frame)
         if should_trigger:
-            grid = stacker.make_grid(frame_idx)
-            # grid: PIL.Image 2×2 拼图
+            grid = stacker.make_grid(current_frame=frame)
 """
 
 import cv2
@@ -26,23 +27,28 @@ from PIL import Image
 
 class MultiFrameStacker:
     """
-    维护帧缓冲区，按需生成 2×2 拼图。
+    聚光灯视频管拼图生成器。
 
-    缓冲区存最近 N 帧（按 interval 采样），
-    生成拼图时取 T, T-interval, T-2*interval, T-3*interval。
+    按照文档规范:
+      - 回溯 τ 秒的时间窗
+      - 降采样至 target_fps（默认 4fps）
+      - 输出 2×2 四宫格或帧序列
     """
 
     def __init__(
         self,
-        buffer_interval_frames: int = 6,  # 每隔 6 帧采一帧进 buffer
-        grid_size: tuple = (768, 768),     # 输出拼图总尺寸
-        max_buffer: int = 20,              # 最大缓冲帧数
+        buffer_interval_frames: int = 8,
+        grid_size: tuple = (768, 768),
+        max_buffer: int = 30,
+        lookback_sec: float = 3.0,
+        target_fps: float = 4.0,
     ):
         self.buffer_interval = buffer_interval_frames
         self.grid_size = grid_size
         self.max_buffer = max_buffer
+        self.lookback_sec = lookback_sec
+        self.target_fps = target_fps
 
-        # frame_idx → BGR frame
         self._buffer: deque = deque(maxlen=max_buffer)
         self._last_push_idx: int = -999
 
@@ -51,74 +57,58 @@ class MultiFrameStacker:
         self._last_push_idx = -999
 
     def push(self, frame_idx: int, frame: np.ndarray):
-        """
-        按间隔将帧推入缓冲区。
-
-        Args:
-            frame_idx: 帧号
-            frame: BGR 帧
-        """
+        """按间隔将帧推入缓冲区。"""
         if frame_idx - self._last_push_idx >= self.buffer_interval:
             self._buffer.append((frame_idx, frame))
             self._last_push_idx = frame_idx
 
     def can_make_grid(self) -> bool:
-        """是否有足够帧生成 4 宫格"""
         return len(self._buffer) >= 4
 
     def make_grid(self, current_frame: Optional[np.ndarray] = None) -> Optional[Image.Image]:
         """
-        生成 2×2 拼图。
+        生成 2×2 聚光灯拼图。
 
-        取缓冲区最新的 4 帧，排列为:
-          [最旧] [次旧]
-          [次新] [最新]
-
-        如果传入 current_frame 且缓冲区不足 4 帧，用 current_frame 补齐。
-
-        Returns:
-            PIL.Image (RGB) 或 None
+        从缓冲区中按均匀间隔选取 4 帧，模拟 τ 秒回溯 + 4fps 降采样。
         """
         frames = list(self._buffer)
 
         if current_frame is not None:
-            # 确保当前帧也在
             frames.append((-1, current_frame))
 
         if len(frames) < 2:
             return None
 
-        # 取最新的 4 帧（或不足 4 帧时用最新帧重复）
-        selected = frames[-4:] if len(frames) >= 4 else frames
-        while len(selected) < 4:
-            selected.insert(0, selected[0])  # 用最旧帧重复
+        # 均匀采样 4 帧：从可用帧中等距选取
+        n = len(frames)
+        if n >= 4:
+            indices = [
+                0,
+                n // 3,
+                (2 * n) // 3,
+                n - 1,
+            ]
+            selected = [frames[i] for i in indices]
+        else:
+            selected = list(frames)
+            while len(selected) < 4:
+                selected.insert(0, selected[0])
 
-        # 提取 BGR frames
         imgs = [s[1] for s in selected]
 
-        # 每个子图的尺寸
         cell_w = self.grid_size[0] // 2
         cell_h = self.grid_size[1] // 2
 
-        # Resize 每帧到 cell 大小
-        resized = []
-        for img in imgs:
-            r = cv2.resize(img, (cell_w, cell_h), interpolation=cv2.INTER_LINEAR)
-            resized.append(r)
+        resized = [
+            cv2.resize(img, (cell_w, cell_h), interpolation=cv2.INTER_LINEAR)
+            for img in imgs
+        ]
 
-        # 拼成 2×2
-        # [0] [1]
-        # [2] [3]
         top = np.concatenate([resized[0], resized[1]], axis=1)
         bottom = np.concatenate([resized[2], resized[3]], axis=1)
         grid = np.concatenate([top, bottom], axis=0)
 
-        # 添加时间标注
-        ts_labels = []
-        for s in selected:
-            fidx = s[0]
-            ts_labels.append(str(fidx) if fidx >= 0 else "now")
-
+        ts_labels = [str(s[0]) if s[0] >= 0 else "now" for s in selected]
         font = cv2.FONT_HERSHEY_SIMPLEX
         positions = [
             (5, cell_h - 8),
@@ -129,7 +119,6 @@ class MultiFrameStacker:
         for label, pos in zip(ts_labels, positions):
             cv2.putText(grid, f"F#{label}", pos, font, 0.5, (0, 255, 255), 1)
 
-        # BGR → RGB → PIL
         rgb = cv2.cvtColor(grid, cv2.COLOR_BGR2RGB)
         return Image.fromarray(rgb)
 
@@ -151,9 +140,14 @@ class MultiFrameStacker:
         if len(frames) < 2:
             return None, []
 
-        selected = frames[-4:] if len(frames) >= 4 else frames
-        while len(selected) < 4:
-            selected.insert(0, selected[0])
+        n = len(frames)
+        if n >= 4:
+            indices = [0, n // 3, (2 * n) // 3, n - 1]
+            selected = [frames[i] for i in indices]
+        else:
+            selected = list(frames)
+            while len(selected) < 4:
+                selected.insert(0, selected[0])
 
         timestamps = [s[0] / max(fps, 1e-6) if s[0] >= 0 else -1.0 for s in selected]
 

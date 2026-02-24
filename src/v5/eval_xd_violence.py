@@ -30,7 +30,7 @@ import cv2
 import numpy as np
 
 # ── 日志 ──
-_log_base = "/data/liuzhe/EventVAD/output/v5/eval_xd_violence"
+_log_base = "/date/liuzhe/EventVAD/EventVAD/output/v5/eval_xd_violence"
 _run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 _log_dir = f"{_log_base}/run_{_run_ts}"
 os.makedirs(_log_dir, exist_ok=True)
@@ -54,9 +54,9 @@ from v5.config import OUTPUT_DIR
 
 
 # ── 数据加载 ──────────────────────────────────────────
-XD_ROOT = Path("/data/liuzhe/EventVAD/src/event_seg/videos/xdviolence")
+XD_ROOT = Path("/date/liuzhe/EventVAD/EventVAD/src/event_seg/videos/xdviolence")
 XD_VIDEOS = XD_ROOT / "videos"
-ANN_FILE = Path("/data/liuzhe/EventVAD/src/event_seg/videos/annotations.txt")
+ANN_FILE = Path("/date/liuzhe/EventVAD/EventVAD/src/event_seg/videos/annotations.txt")
 
 
 @dataclass
@@ -426,11 +426,16 @@ def compute_metrics(results: list[dict]) -> dict:
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-    # Frame-level AUC-ROC & AP
+    # Frame-level metrics: AUC-ROC, AP, EER, Max F1
     frame_auc = 0.0
     frame_ap = 0.0
+    frame_eer = 1.0
+    frame_max_f1 = 0.0
     try:
-        from sklearn.metrics import roc_auc_score, average_precision_score
+        from sklearn.metrics import (
+            roc_auc_score, average_precision_score,
+            roc_curve, precision_recall_curve,
+        )
         all_gt, all_pred = [], []
         for r in results:
             tf = r.get("total_frames", 0)
@@ -447,8 +452,25 @@ def compute_metrics(results: list[dict]) -> dict:
             all_pred.extend(pred_scores.tolist())
 
         if len(set(all_gt)) > 1:
-            frame_auc = roc_auc_score(all_gt, all_pred)
-            frame_ap = average_precision_score(all_gt, all_pred)
+            all_gt_np = np.array(all_gt)
+            all_pred_np = np.array(all_pred)
+
+            frame_auc = roc_auc_score(all_gt_np, all_pred_np)
+            frame_ap = average_precision_score(all_gt_np, all_pred_np)
+
+            # EER: FPR == FNR (i.e., FPR == 1 - TPR)
+            fpr, tpr, _ = roc_curve(all_gt_np, all_pred_np)
+            fnr = 1.0 - tpr
+            eer_idx = np.nanargmin(np.abs(fpr - fnr))
+            frame_eer = float((fpr[eer_idx] + fnr[eer_idx]) / 2.0)
+
+            # Max F1: best F1 across all thresholds on PR curve
+            prec_arr, rec_arr, _ = precision_recall_curve(all_gt_np, all_pred_np)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                f1_arr = 2 * prec_arr * rec_arr / (prec_arr + rec_arr)
+            f1_arr = np.nan_to_num(f1_arr, nan=0.0)
+            frame_max_f1 = float(f1_arr.max())
+
         logger.info(
             f"Frame-level stats: {len(all_gt)} total frames, "
             f"{sum(all_gt)} anomaly frames ({100*sum(all_gt)/max(len(all_gt),1):.1f}%)"
@@ -492,6 +514,8 @@ def compute_metrics(results: list[dict]) -> dict:
         "f1": round(f1, 4),
         "frame_auc": round(frame_auc, 4),
         "frame_ap": round(frame_ap, 4),
+        "frame_eer": round(frame_eer, 4),
+        "frame_max_f1": round(frame_max_f1, 4),
         "video_auc": round(video_auc, 4),
         "tp": tp, "fn": fn, "fp": fp, "tn": tn,
         "total": total,
@@ -509,6 +533,8 @@ def print_metrics(metrics: dict):
     print(f"  F1 Score:              {metrics['f1']:.4f}")
     print(f"  ★ Frame-level AUC-ROC: {metrics.get('frame_auc', 0):.4f}")
     print(f"  ★ Frame-level AP:      {metrics.get('frame_ap', 0):.4f}")
+    print(f"  ★ Frame-level EER:     {metrics.get('frame_eer', 1):.4f}")
+    print(f"  ★ Frame-level Max F1:  {metrics.get('frame_max_f1', 0):.4f}")
     print(f"  Video-level AUC-ROC:   {metrics.get('video_auc', 0):.4f}")
     print(f"  TP={metrics['tp']}  FN={metrics['fn']}  FP={metrics['fp']}  TN={metrics['tn']}")
     print(f"  Total time: {metrics.get('total_time_sec', 0)}s "

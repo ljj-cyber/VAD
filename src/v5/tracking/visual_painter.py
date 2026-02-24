@@ -66,10 +66,12 @@ class VisualPainter:
         output_size: tuple = (768, 768),
         box_thickness: int = 3,
         font_scale: float = 0.6,
+        spotlight_dim_factor: float = 0.7,
     ):
         self.output_size = output_size
         self.box_thickness = box_thickness
         self.font_scale = font_scale
+        self.spotlight_dim_factor = spotlight_dim_factor
 
     def paint(
         self,
@@ -78,7 +80,12 @@ class VisualPainter:
         entity_ids: Optional[list[int]] = None,
     ) -> Image.Image:
         """
-        在原图上绘制高亮框，返回 PIL Image。
+        在原图上绘制高亮框 + 聚光灯效果（背景亮度下调 30%），返回 PIL Image。
+
+        聚光灯效果：
+          1. 将全图亮度降低 30%（形成暗背景）
+          2. 在 bbox 区域恢复原始亮度（实体"高亮"）
+          3. 绘制红/黄/橙色边界框 + 标注
 
         Args:
             frame: BGR 原图 (H, W, 3)
@@ -86,30 +93,38 @@ class VisualPainter:
             entity_ids: 对应的 entity_id 列表（可选）
 
         Returns:
-            PIL.Image: 带框的原图（已 resize）
+            PIL.Image: 带聚光灯效果的标注图（已 resize）
         """
-        canvas = frame.copy()
+        # 聚光灯：先将全图亮度降低 30%
+        dimmed = (frame.astype(np.float32) * self.spotlight_dim_factor).astype(np.uint8)
+        canvas = dimmed.copy()
+
+        # 在每个 bbox 区域恢复原始亮度（高亮实体）
+        for region in regions:
+            x1, y1 = region.x, region.y
+            x2, y2 = region.x + region.w, region.y + region.h
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(frame.shape[1], x2)
+            y2 = min(frame.shape[0], y2)
+            canvas[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
 
         for i, region in enumerate(regions):
             eid = entity_ids[i] if entity_ids and i < len(entity_ids) else i
             color = _energy_color(region.kinetic_energy)
-            # 如果有 YOLO 类别信息，附加到标签
             cls_tag = ""
             if hasattr(region, "class_name") and region.class_name:
                 cls_tag = f" {region.class_name}"
             label = f"E#{eid}{cls_tag} [{_energy_label(region.kinetic_energy)}]"
 
-            # 画框
             x1, y1 = region.x, region.y
             x2, y2 = region.x + region.w, region.y + region.h
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, self.box_thickness)
 
-            # 标注文字 (框上方)
             text_size = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, self.font_scale, 2
             )[0]
             text_y = max(y1 - 8, text_size[1] + 4)
-            # 文字背景
             cv2.rectangle(
                 canvas,
                 (x1, text_y - text_size[1] - 4),
@@ -123,9 +138,7 @@ class VisualPainter:
                 self.font_scale, (255, 255, 255), 2,
             )
 
-        # Resize 到 VLLM 输入尺寸
         resized = cv2.resize(canvas, self.output_size, interpolation=cv2.INTER_LINEAR)
-        # BGR → RGB → PIL
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         return Image.fromarray(rgb)
 

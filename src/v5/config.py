@@ -151,27 +151,27 @@ class NodeTriggerConfig:
     # 降低以对火焰/烟雾等渐变信号更敏感 (0.30 → 0.22)
     embedding_jump_threshold: float = 0.22  # 1 - cosine_similarity
     # Rule 3: Heartbeat — 距上次采样最大间隔 (秒)
-    # ★ 增大以减少 trigger 数量，降低 VLLM 调用开销 (3.0 → 5.0)
-    heartbeat_interval_sec: float = 5.0
+    heartbeat_interval_sec: float = 3.0
     # 最大触发频率保护 (同一实体相邻触发的最小间隔帧数)
-    # ★ 增大以减少密集触发 (5 → 8)
-    min_trigger_gap_frames: int = 8
+    min_trigger_gap_frames: int = 5
 
 
 class SemanticVLLMConfig:
     """VLLM 语义推理 (仅对 crop 区域)"""
 
     # VLLM model
-    model_name: str = "qwen2.5-vl-7b"
+    model_name: str = "qwen2.5-vl-32b"
     MODEL_PATHS: dict = {
         "qwen2-vl-7b": "Qwen/Qwen2-VL-7B-Instruct",
         "qwen2.5-vl-7b": "/data/liuzhe/Qwen2.5-VL-7B-Instruct",
+        "qwen2.5-vl-32b": "Qwen/Qwen2.5-VL-32B-Instruct",
     }
 
     # 本地模型路径 (用于 backend="local")
     LOCAL_MODEL_PATHS: dict = {
         "qwen2.5-vl-7b": "/data/liuzhe/Qwen2.5-VL-7B-Instruct",
         "qwen2-vl-7b": str(HF_CACHE_DIR / "hub" / "models--Qwen--Qwen2-VL-7B-Instruct"),
+        "qwen2.5-vl-32b": str(HF_CACHE_DIR / "hub" / "models--Qwen--Qwen2.5-VL-32B-Instruct"),
     }
 
     # API server
@@ -180,8 +180,7 @@ class SemanticVLLMConfig:
     max_workers: int = 16
 
     # 推理参数
-    # ★ 减少 max_new_tokens 加速推理 (256 → 192)
-    max_new_tokens: int = 192
+    max_new_tokens: int = 512
     temperature: float = 0.0
     max_retries: int = 2
 

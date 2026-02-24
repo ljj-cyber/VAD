@@ -484,9 +484,7 @@ class DecisionAuditor:
         """通过 vLLM server 调用 Decision LLM"""
         import httpx
 
-        model_name = self.vllm_cfg.MODEL_PATHS.get(
-            self.vllm_cfg.model_name, self.vllm_cfg.model_name
-        )
+        model_name = self.vllm_cfg.model_name
 
         payload = {
             "model": model_name,
@@ -577,15 +575,31 @@ class DecisionAuditor:
         import re
 
         parsed = None
+        text = raw_response.strip()
+
+        # 去除 ```json ... ``` 包裹
+        md_match = re.search(r'```(?:json)?\s*(\{.*)', text, re.DOTALL)
+        if md_match:
+            text = md_match.group(1)
+            text = re.sub(r'```\s*$', '', text).strip()
+
         try:
-            parsed = json.loads(raw_response)
+            parsed = json.loads(text)
         except json.JSONDecodeError:
-            match = re.search(r'\{[^{}]*\}', raw_response, re.DOTALL)
-            if match:
-                try:
-                    parsed = json.loads(match.group())
-                except json.JSONDecodeError:
-                    pass
+            brace_start = text.find('{')
+            if brace_start >= 0:
+                depth = 0
+                for i in range(brace_start, len(text)):
+                    if text[i] == '{':
+                        depth += 1
+                    elif text[i] == '}':
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                parsed = json.loads(text[brace_start:i+1])
+                            except json.JSONDecodeError:
+                                pass
+                            break
 
         if parsed is None:
             logger.warning(

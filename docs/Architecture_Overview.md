@@ -6,14 +6,15 @@
 
 ## 一、项目定位
 
-EventVAD 是一套**无需训练**的视频异常检测系统，核心思想是将长时未剪辑的监控视频首先切分为语义连贯的**事件片段**，再利用视觉语言模型 (VLLM) 对每个片段进行异常评分，最终输出帧级异常分数并用 AUC 评估。
+EventVAD 是一套**无需训练**的视频异常检测系统，核心思想是将长时未剪辑的监控视频首先切分为语义连贯的**事件片段**，再利用视觉语言模型 (VLLM / LMM) 对每个片段进行异常评分，最终输出帧级异常分数并用 AUC 评估。
 
-项目目前包含**两套异常检测路径**：
+项目目前包含**三套异常检测路径**：
 
 | 路径 | 代号 | 方法论 | 状态 |
 |------|------|--------|------|
 | **事件分割 + VLLM 评分** | V1/V2 Pipeline | CLIP + 光流 → 图传播 → 边界检测 → VideoLLaMA2 评分 | ✅ 已上线 |
 | **纯语义时间图** | V3 System | VLLM 感知 → 语义 Re-ID → 时间图 → 路径模板匹配 | ✅ 原型完成 |
+| **管状骨架 (Tube-Skeleton)** | V5 System | 物理感知追踪 → 聚光灯流 + LMM 视觉语义 → 动态图 + LMM 文本审计 | ✅ 主力系统 |
 
 ---
 
@@ -24,25 +25,24 @@ EventVAD 是一套**无需训练**的视频异常检测系统，核心思想是�
                     │                    EventVAD System                    │
                     └───────────────────────────────────────────────────────┘
                                            │
-                         ┌─────────────────┼─────────────────┐
-                         ▼                                   ▼
-              ┌──────────────────────┐           ┌──────────────────────┐
-              │   V1/V2 Pipeline     │           │     V3 System        │
-              │  (Event Segmentation │           │ (Semantic Temporal   │
-              │   + VLLM Scoring)    │           │     Graph)           │
-              └──────────────────────┘           └──────────────────────┘
-                         │                                   │
-    ┌────────────────────┼────────────────┐                  │
-    ▼                    ▼                ▼                   ▼
-┌────────┐      ┌────────────┐     ┌──────────┐     ┌──────────────┐
-│ Step 1 │      │   Step 2   │     │  Step 3  │     │   端到端     │
-│事件分割│ ──── │ VideoLLaMA2│ ──── │ AUC评估 │     │  异常检测   │
-│ (GPU)  │      │   评分     │     │          │     │ (VLLM+图)   │
-└────────┘      └────────────┘     └──────────┘     └──────────────┘
-    │                │                   │                   │
-    ▼                ▼                   ▼                   ▼
-  视频片段       异常分数            AUC指标           视频级异常分
-  + manifest     scores.txt        auc.txt          + 实体级分析
+              ┌────────────────────────────┼────────────────────────────┐
+              ▼                            ▼                            ▼
+  ┌──────────────────────┐   ┌──────────────────────┐   ┌──────────────────────┐
+  │   V1/V2 Pipeline     │   │     V3 System        │   │   V5 System (主力)   │
+  │  (Event Segmentation │   │ (Semantic Temporal   │   │ (Tube-Skeleton       │
+  │   + VLLM Scoring)    │   │     Graph)           │   │  Pipeline)           │
+  └──────────────────────┘   └──────────────────────┘   └──────────────────────┘
+              │                            │                            │
+              ▼                            ▼                            ▼
+  ┌──────────────────┐       ┌──────────────────┐       ┌──────────────────────┐
+  │ CLIP+光流→分割   │       │ VLLM→语义Re-ID   │       │ Stage1: 物理感知追踪 │
+  │ → VideoLLaMA2    │       │ → 时间图→路径匹配│       │ Stage2: 聚光灯流+LMM │
+  │ → AUC评估        │       │ → 异常检测       │       │ Stage3: 动态图+LMM审计│
+  └──────────────────┘       └──────────────────┘       └──────────────────────┘
+              │                            │                            │
+              ▼                            ▼                            ▼
+        帧级异常分数               视频级异常分析              Verdict + 帧级定位
+        + AUC 指标                + 实体级分析              + 卷宗叙事 + 逻辑依据
 ```
 
 ---
@@ -99,6 +99,28 @@ EventVAD/
 │   │   │   └── anomaly_detector.py    #     多信号融合检测器
 │   │   └── utils/
 │   │       └── json_schema.py         #     JSON Schema 校验
+│   │
+│   ├── v5/                            # ─── V5 管状骨架系统 (主力) ───
+│   │   ├── config.py                  #   全局配置（11个配置类）
+│   │   ├── pipeline.py                #   主管线入口
+│   │   ├── tracking/                  #   Stage 1: 物理感知与追踪
+│   │   │   ├── motion_extractor.py    #     动能提取（帧差法）
+│   │   │   ├── yolo_detector.py       #     开放词汇检测（YOLO-World）
+│   │   │   ├── hybrid_detector.py     #     帧差+YOLO 融合
+│   │   │   ├── clip_encoder.py        #     CLIP 特征编码
+│   │   │   ├── entity_tracker.py      #     实体贪婪追踪
+│   │   │   ├── visual_painter.py      #     聚光灯视觉提示
+│   │   │   └── multi_frame_stacker.py #     多帧时序构建
+│   │   ├── semantic/                  #   Stage 2: 稀疏触发+视觉语义
+│   │   │   ├── node_trigger.py        #     稀疏触发网关
+│   │   │   ├── vllm_semantic.py       #     LMM 视觉感知调用
+│   │   │   ├── discordance_checker.py #     矛盾校验
+│   │   │   └── global_heartbeat.py    #     全局心跳+漂移检测
+│   │   └── graph/                     #   Stage 3: 动态图组装+审计
+│   │       ├── structures.py          #     图数据结构 G^(e)
+│   │       ├── graph_builder.py       #     动态图组装
+│   │       ├── narrative_generator.py #     卷宗叙事生成
+│   │       └── decision_prompt.py     #     LMM 文本审计
 │   │
 │   ├── LAVIS/                         # ─── LAVIS 框架（CLIP 模型） ───
 │   └── RAFT/                          # ─── RAFT 光流模型 ───
@@ -165,17 +187,52 @@ EventVAD/
 | Qwen2-VL-7B / Moondream2 | 帧级语义感知 | `eventvad_vllm` |
 | Sentence-BERT (all-MiniLM-L6-v2) | 文本画像嵌入 / Re-ID | `eventvad_vllm` |
 
-### 4.3 设计哲学差异
+### 4.3 V5 管状骨架 (Tube-Skeleton Pipeline)
 
-| 维度 | V1/V2 Pipeline | V3 System |
-|------|----------------|-----------|
-| **异常判定点** | 段级（VideoLLaMA2 对每个片段评分） | 实体级（路径演化偏离模板） |
-| **特征空间** | 视觉特征（CLIP + 光流） | 语义特征（动作 + 画像文本） |
-| **图结构** | 无向图（帧 ↔ 帧，边权 = 语义+运动） | 有向图（实体状态 → 实体状态） |
-| **边界意义** | 事件切换点 | 行为状态转移 |
-| **可解释性** | 低（VLLM 黑盒评分） | 高（可追溯异常路径和断裂点） |
-| **适用规模** | 大规模批量（数千视频） | 精细分析（单视频 / 小批量） |
-| **计算开销** | 中（CLIP + 光流 + VideoLLaMA2） | 高（逐帧 VLLM 推理） |
+```
+原始视频流 (1080P/720P, 常规帧率)
+     → Stage 1: 物理感知与追踪
+         帧差动能提取 + YOLO-World 开放词汇检测
+         → CLIP 视觉特征 z_i → 贪婪匹配 → 实体追踪 (Tracklets)
+     → Stage 2: 稀疏触发与视觉语义抽取
+         三规则触发 (Birth/Change/Heartbeat)
+         → 聚光灯流构建 (回溯τs + 4fps降采样 + 红框视觉提示)
+         → LMM 视觉感知 (Qwen2.5-VL / LLaVA-OneVision)
+         → 结构化 JSON 语义标签 s_i
+     → Stage 3: 动态图组装与文本审计
+         → 有向图 G^(e) 构建 + 矛盾校验 (DiscordanceCheck)
+         → 卷宗叙事生成 + LMM 文本审计
+         → 最终裁决 Verdict (is_anomaly, confidence, 异常区间, reason)
+```
+
+**优势：**
+- 物理先验 + 语义理解双通道互补
+- 稀疏触发策略大幅降低 LMM 调用开销
+- 聚光灯流提供时序上下文，解决单帧盲区
+- 矛盾校验兜底语义盲区
+- 零先验判断，泛化性强
+- 可解释性：卷宗叙事 + 逻辑依据
+
+**关键模型：**
+| 模型 | 用途 | 环境 |
+|------|------|------|
+| Qwen2.5-VL-7B / LLaVA-OneVision | LMM 视觉感知 + 文本审计 | `eventvad_vllm` |
+| CLIP ViT-B/32 | 实体特征编码 + 漂移检测 | `eventvad_vllm` |
+| YOLO-World v2 Large | 开放词汇检测 (可选) | `eventvad_vllm` |
+
+### 4.4 设计哲学差异
+
+| 维度 | V1/V2 Pipeline | V3 System | V5 System |
+|------|----------------|-----------|-----------|
+| **异常判定点** | 段级（VideoLLaMA2 对每个片段评分） | 实体级（路径演化偏离模板） | 实体级（动态图 + LMM 文本审计） |
+| **特征空间** | 视觉特征（CLIP + 光流） | 语义特征（动作 + 画像文本） | 物理动能 + CLIP 视觉 + LMM 语义 |
+| **图结构** | 无向图（帧 ↔ 帧，边权 = 语义+运动） | 有向图（实体状态 → 实体状态） | 有向图 G^(e)（TemporalNode + EvolutionEdge） |
+| **边界意义** | 事件切换点 | 行为状态转移 | 稀疏触发点 (Birth/Change/Heartbeat) |
+| **可解释性** | 低（VLLM 黑盒评分） | 高（可追溯异常路径和断裂点） | 高（卷宗叙事 + 物理预警 + 逻辑依据） |
+| **适用规模** | 大规模批量（数千视频） | 精细分析（单视频 / 小批量） | 中大规模（稀疏触发降低开销） |
+| **计算开销** | 中（CLIP + 光流 + VideoLLaMA2） | 高（逐帧 VLLM 推理） | 中（稀疏触发 + 并行 LMM） |
+| **矛盾检测** | 无 | 无 | DiscordanceChecker + CLIP 漂移 |
+| **LMM 调用模式** | 段级评分 | 逐帧感知 | Vision-Mode (Stage 2) + Text-Mode (Stage 3) |
 
 ---
 
@@ -228,7 +285,31 @@ conda activate eventvad_lavis
 python src/evaluate.py --model_output output/xdviolence/scores.txt --auc_output output/xdviolence/auc.txt
 ```
 
-### 6.2 V3 System（推荐：精细分析）
+### 6.2 V5 System（推荐：主力异常检测）
+
+```bash
+conda activate eventvad_vllm
+cd src
+
+# 单视频分析
+python -m v5.pipeline \
+    --video /path/to/video.mp4 \
+    --api-base http://localhost:8000 \
+    --sample-every 2 --max-workers 48
+
+# UCF-Crime 批量评估
+python -m v5.eval_ucf_crime \
+    --max-videos 40 --sample-every 2 \
+    --api-base http://localhost:8000 \
+    --parallel 6 --max-workers 48
+
+# Bad Case 分析
+python -m v5.analyze_bad_cases \
+    --current output/v5/eval_ucf_crime/run_xxx/results_v5.json \
+    --previous output/v5/eval_ucf_crime/run_yyy/results_v5.json
+```
+
+### 6.3 V3 System（精细分析）
 
 ```bash
 conda activate eventvad_vllm
@@ -324,6 +405,18 @@ output/v3/
     ├── analysis_result.json          # 完整分析结果（异常分数 + 实体详情）
     ├── frame_snapshots.json          # VLLM 语义快照（每帧）
     └── entity_timelines.json         # 实体时间路径 + 边权信息
+```
+
+### V5 System 输出
+
+```
+output/v5/
+├── <video_name>/
+│   └── result.json                   # 完整结果（verdict + graphs + trace_log + timing）
+└── eval_ucf_crime/
+    └── run_<timestamp>/
+        ├── results_v5.json           # 批量评估结果
+        └── logs/                     # 逐视频详细日志
 ```
 
 ---
@@ -513,7 +606,8 @@ python -m v3.pipeline --video event_seg/videos/xdviolence/sample.mp4
 
 | 文档 | 路径 | 内容 |
 |------|------|------|
-| **本文档** | `docs/Architecture_Overview.md` | 项目全局架构、两条路径对比、目录结构、执行流程 |
+| **本文档** | `docs/Architecture_Overview.md` | 项目全局架构、三条路径对比、目录结构、执行流程 |
+| **V5 功能文档** | `docs/EventVAD_V5_Function_Documentation.md` | V5 管状骨架系统三阶段详细说明（物理感知→聚光灯流→动态图审计） |
 | **V1/V2 技术文档** | `docs/EventSeg_Pipeline_Documentation.md` | 事件分割管线每个模块的详细说明、优化策略、配置调优 |
 | **V3 技术文档** | `docs/V3_System_Documentation.md` | 纯语义时间图系统的完整设计、算法公式、业务示例 |
 | **项目 README** | `README.md` | 安装说明、数据集准备、基础用法、论文引用 |
@@ -521,5 +615,5 @@ python -m v3.pipeline --video event_seg/videos/xdviolence/sample.mp4
 
 ---
 
-*文档生成日期: 2026-02-13*
-*系统版本: EventVAD (ACM Multimedia 2025)*
+*文档更新日期: 2026-02-23*
+*系统版本: EventVAD V5 (ACM Multimedia 2025)*

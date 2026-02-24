@@ -18,6 +18,7 @@ Stage 1-A': YoloDetector — YOLO-World 开放词汇目标检测
 """
 
 import logging
+import ssl
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +26,9 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+# 绕过自签名证书导致的 CLIP 模型下载失败
+ssl._create_default_https_context = ssl._create_unverified_context
 
 from ..config import YoloDetectorConfig
 
